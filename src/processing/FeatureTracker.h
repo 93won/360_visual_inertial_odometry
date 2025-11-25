@@ -11,14 +11,17 @@
 
 #pragma once
 
-#include "Camera.h"
-#include "Feature.h"
-#include "Frame.h"
 #include <opencv2/opencv.hpp>
+#include <Eigen/Dense>
 #include <memory>
 #include <vector>
 
 namespace vio_360 {
+
+// Forward declarations
+class Camera;
+class Feature;
+class Frame;
 
 /**
  * @brief Feature tracker for 360-degree ERP images

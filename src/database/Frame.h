@@ -11,7 +11,6 @@
 
 #pragma once
 
-#include "Feature.h"
 #include <opencv2/opencv.hpp>
 #include <Eigen/Dense>
 #include <vector>
@@ -19,6 +18,9 @@
 #include <mutex>
 
 namespace vio_360 {
+
+// Forward declaration
+class Feature;
 
 /**
  * @brief IMU measurement structure

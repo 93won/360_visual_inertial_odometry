@@ -10,6 +10,7 @@
  */
 
 #include "Frame.h"
+#include "Feature.h"
 
 namespace vio_360 {
 

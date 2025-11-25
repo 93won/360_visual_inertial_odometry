@@ -41,6 +41,21 @@ public:
     cv::Point2f BearingToPixel(const Eigen::Vector3f& bearing) const;
     
     /**
+     * @brief Project 3D point in camera frame to pixel coordinates
+     * @param point_c 3D point in camera coordinate system
+     * @return Pixel coordinates (u, v)
+     */
+    cv::Point2f Project(const Eigen::Vector3f& point_c) const;
+    
+    /**
+     * @brief Project 3D point in world frame to pixel coordinates
+     * @param point_w 3D point in world coordinate system
+     * @param T_cw Camera-to-world transformation (4x4)
+     * @return Pixel coordinates (u, v)
+     */
+    cv::Point2f ProjectWorld(const Eigen::Vector3f& point_w, const Eigen::Matrix4f& T_cw) const;
+    
+    /**
      * @brief Compute angular distance between two bearing vectors
      * @param bearing1 First bearing vector
      * @param bearing2 Second bearing vector

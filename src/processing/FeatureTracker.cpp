@@ -10,6 +10,8 @@
  */
 
 #include "FeatureTracker.h"
+#include "Camera.h"
+#include "Feature.h"
 #include "Frame.h"
 #include "ConfigUtils.h"
 #include <algorithm>

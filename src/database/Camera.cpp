@@ -59,6 +59,26 @@ cv::Point2f Camera::BearingToPixel(const Eigen::Vector3f& bearing) const {
     return pixel;
 }
 
+cv::Point2f Camera::Project(const Eigen::Vector3f& point_c) const {
+    // Normalize to get bearing vector
+    Eigen::Vector3f bearing = point_c.normalized();
+    
+    // Convert bearing to pixel
+    return BearingToPixel(bearing);
+}
+
+cv::Point2f Camera::ProjectWorld(const Eigen::Vector3f& point_w, const Eigen::Matrix4f& T_cw) const {
+    // Transform point from world to camera frame
+    Eigen::Vector4f point_w_homo;
+    point_w_homo << point_w, 1.0f;
+    
+    Eigen::Vector4f point_c_homo = T_cw * point_w_homo;
+    Eigen::Vector3f point_c = point_c_homo.head<3>();
+    
+    // Project to pixel
+    return Project(point_c);
+}
+
 float Camera::AngularDistance(const Eigen::Vector3f& bearing1, 
                              const Eigen::Vector3f& bearing2) const {
     // Compute angular distance using dot product
