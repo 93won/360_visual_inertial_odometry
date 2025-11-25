@@ -22,7 +22,7 @@ namespace vio_360 {
 class Frame;
 class Camera;
 class FeatureTracker;
-// class MonocularInitializer;  // TODO: Will be implemented later
+class Initializer;
 
 /**
  * @brief Main VIO estimator class
@@ -103,7 +103,7 @@ public:
 private:
     // System components
     std::unique_ptr<FeatureTracker> m_feature_tracker;
-    // std::unique_ptr<MonocularInitializer> m_monocular_initializer;  // TODO: Will be implemented later
+    std::unique_ptr<Initializer> m_initializer;
     std::shared_ptr<Camera> m_camera;
     
     // State
@@ -113,11 +113,16 @@ private:
     std::vector<std::shared_ptr<Frame>> m_all_frames;
     std::vector<std::shared_ptr<Frame>> m_keyframes;
     
+    // Frame window for initialization
+    std::vector<std::shared_ptr<Frame>> m_frame_window;
+    int m_window_size;
+    
     // Frame management
     int m_frame_id_counter;
     
     // Initialization state
     bool m_initialized;
+    float m_min_parallax;
     
     // Current pose (T_wc: world to camera)
     Eigen::Matrix4f m_current_pose;

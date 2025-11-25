@@ -29,6 +29,10 @@ ransac:
 tracking:
   min_features_ratio: 0.5
 
+initialization:
+  window_size: 10
+  min_parallax: 10.0
+
 visualization:
   scale: 1.0
   show_grid: 1

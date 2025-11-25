@@ -36,6 +36,7 @@ set(SOURCES
     src/database/Frame.cpp
     src/processing/FeatureTracker.cpp
     src/processing/Estimator.cpp
+    src/processing/Initializer.cpp
     src/util/LieUtils.cpp
     src/util/ConfigUtils.cpp
     src/util/VizUtils.cpp

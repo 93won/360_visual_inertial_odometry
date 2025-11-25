@@ -55,10 +55,16 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
     if (!previous_frame || previous_frame->GetFeatures().empty()) {
         std::vector<cv::Point2f> detected_points = DetectNewFeatures(current_image);
         
+        int feature_index = 0;
         for (const auto& pt : detected_points) {
             auto feature = std::make_shared<Feature>(m_next_feature_id++, pt);
             feature->SetBearing(m_camera->PixelToBearing(pt));
+            
+            // Add initial observation for first frame
+            feature->AddObservation(current_frame, feature_index);
+            
             current_frame->AddFeature(feature);
+            feature_index++;
         }
         
         m_num_tracked = 0;
@@ -116,6 +122,8 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
     }
     
     // Create features from inliers
+    int current_feature_index = 0;
+    int total_observations = 0;
     for (size_t i = 0; i < inlier_mask.size(); ++i) {
         if (inlier_mask[i]) {
             auto prev_feature = good_prev_features[i];
@@ -133,11 +141,17 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
             velocity.y() = good_curr_points[i].y - good_prev_points[i].y;
             feature->SetVelocity(velocity);
             
+            // Update observations: copy from previous feature + add current frame
+            feature->UpdateFeatureObservations(prev_feature, current_frame, current_feature_index);
+            total_observations += feature->GetObservationCount();
+            
             current_frame->AddFeature(feature);
+            current_feature_index++;
         }
     }
     
     m_num_tracked = static_cast<int>(current_frame->GetFeatureCount());
+    
     
     // Remove clustered features before grid assignment
     RemoveClusteredFeatures(current_frame);
@@ -151,10 +165,19 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
         cv::Mat mask = CreateFeatureMask(current_frame->GetFeatures());
         std::vector<cv::Point2f> new_points = DetectNewFeatures(current_image, mask);
         
+        // Get current feature count for indexing new features
+        int base_feature_index = static_cast<int>(current_frame->GetFeatureCount());
+        int new_feature_index = 0;
+        
         for (const auto& pt : new_points) {
             auto feature = std::make_shared<Feature>(m_next_feature_id++, pt);
             feature->SetBearing(m_camera->PixelToBearing(pt));
+            
+            // Add initial observation for newly detected features
+            feature->AddObservation(current_frame, base_feature_index + new_feature_index);
+            
             current_frame->AddFeature(feature);
+            new_feature_index++;
         }
         
         m_num_detected = static_cast<int>(new_points.size());

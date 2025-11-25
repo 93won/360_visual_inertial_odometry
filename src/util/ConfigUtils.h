@@ -59,6 +59,10 @@ public:
     // Tracking
     float tracking_min_features_ratio;
     
+    // Initialization
+    int initialization_window_size;
+    float initialization_min_parallax;
+    
     // Visualization
     float visualization_scale;
     bool visualization_show_grid;

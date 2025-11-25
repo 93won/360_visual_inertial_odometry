@@ -54,6 +54,10 @@ void ConfigUtils::SetDefaultValues() {
     // Tracking
     tracking_min_features_ratio = 0.5f;
     
+    // Initialization
+    initialization_window_size = 20;
+    initialization_min_parallax = 10.0f;
+    
     // Visualization
     visualization_scale = 1.0f;
     visualization_show_grid = true;
@@ -132,6 +136,13 @@ bool ConfigUtils::Load(const std::string& config_file) {
     cv::FileNode tracking = fs["tracking"];
     if (!tracking.empty()) {
         tracking_min_features_ratio = (float)(double)tracking["min_features_ratio"];
+    }
+    
+    // Initialization
+    cv::FileNode initialization = fs["initialization"];
+    if (!initialization.empty()) {
+        initialization_window_size = (int)initialization["window_size"];
+        initialization_min_parallax = (float)(double)initialization["min_parallax"];
     }
     
     // Visualization

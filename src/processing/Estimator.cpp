@@ -11,6 +11,7 @@
 
 #include "Estimator.h"
 #include "FeatureTracker.h"
+#include "Initializer.h"
 #include "Camera.h"
 #include "Frame.h"
 #include "ConfigUtils.h"
@@ -39,11 +40,18 @@ Estimator::Estimator()
         config.quality_level
     );
     
-    // TODO: Initialize monocular initializer (will be implemented later)
-    // m_monocular_initializer = std::make_unique<MonocularInitializer>();
+    // Initialize monocular initializer
+    m_initializer = std::make_unique<Initializer>();
+    
+    // Load initialization parameters from config
+    m_window_size = config.initialization_window_size;
+    m_min_parallax = config.initialization_min_parallax;
+    m_frame_window.reserve(m_window_size);
     
     std::cout << "[ESTIMATOR] Initialized with camera " 
               << config.camera_width << "x" << config.camera_height << std::endl;
+    std::cout << "[ESTIMATOR] Initialization: window_size=" << m_window_size
+              << ", min_parallax=" << m_min_parallax << " pixels" << std::endl;
 }
 
 Estimator::~Estimator() {
@@ -66,12 +74,22 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             DetectFeatures();
         }
         
-        // Try to initialize
-        bool init_success = TryInitialize();
-        if (init_success) {
-            std::cout << "[ESTIMATOR] Initialization successful!" << std::endl;
-            m_initialized = true;
-            result.success = true;
+        // Add current frame to window
+        m_frame_window.push_back(m_current_frame);
+        
+        // Maintain window size
+        if (static_cast<int>(m_frame_window.size()) > m_window_size) {
+            m_frame_window.erase(m_frame_window.begin());
+        }
+        
+        // Try to initialize when window is full
+        if (static_cast<int>(m_frame_window.size()) == m_window_size) {
+            bool init_success = TryInitialize();
+            if (init_success) {
+                std::cout << "[ESTIMATOR] Initialization successful!" << std::endl;
+                m_initialized = true;
+                result.success = true;
+            }
         }
     } else {
         // Already initialized - normal tracking
@@ -107,15 +125,39 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
 }
 
 bool Estimator::TryInitialize() {
-    // TODO: Implement monocular initialization
-    // 1. Check if we have enough frames (e.g., 5-10 frames)
-    // 2. Select best pair based on parallax
-    // 3. Compute Essential matrix + RANSAC
-    // 4. Recover pose (R, t)
-    // 5. Triangulate initial map points
-    // 6. Check reprojection error
+    if (m_frame_window.size() < 2) {
+        return false;
+    }
     
-    // For now, just return false
+    // Get first and last frames in window
+    auto first_frame = m_frame_window.front();
+    auto last_frame = m_frame_window.back();
+    
+    // Compute parallax between first and last frames
+    float parallax = m_initializer->ComputeParallax(first_frame, last_frame);
+    
+    std::cout << "[ESTIMATOR] Initialization attempt: window_size=" 
+              << m_frame_window.size() 
+              << ", parallax=" << parallax << " pixels"
+              << " (min required: " << m_min_parallax << ")" << std::endl;
+    
+    // Check if parallax is sufficient
+    if (parallax < m_min_parallax) {
+        std::cout << "[ESTIMATOR] Insufficient parallax for initialization" << std::endl;
+        return false;
+    }
+    
+    std::cout << "[ESTIMATOR] Sufficient parallax! Ready to initialize..." << std::endl;
+    std::cout << "[ESTIMATOR] (Full initialization not yet implemented - pausing here)" << std::endl;
+    
+    // TODO: Implement full monocular initialization
+    // 1. Select features with sufficient observations
+    // 2. Compute Essential matrix + RANSAC
+    // 3. Recover pose (R, t)
+    // 4. Triangulate initial map points
+    // 5. Check reprojection error
+    
+    // For now, just return false (will implement full init later)
     return false;
 }
 
@@ -125,6 +167,7 @@ void Estimator::Reset() {
     m_last_keyframe = nullptr;
     m_all_frames.clear();
     m_keyframes.clear();
+    m_frame_window.clear();
     m_frame_id_counter = 0;
     m_initialized = false;
     m_current_pose = Eigen::Matrix4f::Identity();
