@@ -1,7 +1,8 @@
 /**
  * @file      ConfigUtils.cpp
  * @brief     Implementation of configuration utility
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -10,7 +11,7 @@
  */
 
 #include "ConfigUtils.h"
-#include <iostream>
+#include "Logger.h"
 
 namespace vio_360 {
 
@@ -53,6 +54,7 @@ void ConfigUtils::SetDefaultValues() {
     
     // Tracking
     tracking_min_features_ratio = 0.5f;
+    tracking_min_parallax_for_keyframe = 10.0f;
     
     // Initialization
     initialization_window_size = 20;
@@ -96,12 +98,9 @@ bool ConfigUtils::Load(const std::string& config_file) {
     cv::FileStorage fs(config_file, cv::FileStorage::READ);
     
     if (!fs.isOpened()) {
-        std::cerr << "Failed to open config file: " << config_file << std::endl;
-        std::cerr << "Using default values." << std::endl;
+        LOG_WARN("Config file not found, using defaults");
         return false;
     }
-    
-    std::cout << "Loading configuration from: " << config_file << std::endl;
     
     // Camera parameters
     cv::FileNode camera = fs["camera"];
@@ -144,6 +143,9 @@ bool ConfigUtils::Load(const std::string& config_file) {
     cv::FileNode tracking = fs["tracking"];
     if (!tracking.empty()) {
         tracking_min_features_ratio = (float)(double)tracking["min_features_ratio"];
+        if (!tracking["min_parallax_for_keyframe"].empty()) {
+            tracking_min_parallax_for_keyframe = (float)(double)tracking["min_parallax_for_keyframe"];
+        }
     }
     
     // Initialization
@@ -222,11 +224,8 @@ bool ConfigUtils::Load(const std::string& config_file) {
     
     fs.release();
     
-    std::cout << "Configuration loaded successfully." << std::endl;
-    std::cout << "  Camera: " << camera_width << "x" << camera_height << std::endl;
-    std::cout << "  Max features: " << max_features << std::endl;
-    std::cout << "  Grid: " << grid_cols << "x" << grid_rows 
-              << " (max " << max_features_per_grid << " per cell)" << std::endl;
+    LOG_INFO("Config: {}x{}, {} features, {}x{} grid",
+             camera_width, camera_height, max_features, grid_cols, grid_rows);
     
     return true;
 }

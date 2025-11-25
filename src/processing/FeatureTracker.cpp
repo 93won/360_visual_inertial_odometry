@@ -1,7 +1,8 @@
 /**
  * @file      FeatureTracker.cpp
  * @brief     Implementation of FeatureTracker for ERP images.
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -106,7 +107,6 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
         if (status[i] && 
             !m_camera->IsInPolarRegion(curr_points[i]) &&
             !m_camera->IsNearBoundary(curr_points[i])) {
-            
             good_prev_points.push_back(prev_points[i]);
             good_curr_points.push_back(curr_points[i]);
             good_prev_features.push_back(prev_features_vec[i]);
@@ -151,7 +151,6 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
     }
     
     m_num_tracked = static_cast<int>(current_frame->GetFeatureCount());
-    
     
     // Remove clustered features before grid assignment
     RemoveClusteredFeatures(current_frame);

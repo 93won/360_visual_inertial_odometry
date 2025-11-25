@@ -1,7 +1,8 @@
 /**
  * @file      Initializer.cpp
  * @brief     Implementation of Initializer
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -11,10 +12,11 @@
 
 #include "Initializer.h"
 #include "ConfigUtils.h"
+#include "Logger.h"
+#include "LieUtils.h"
+#include "optimization/Optimizer.h"
 #include <algorithm>
 #include <cmath>
-#include <iostream>
-#include <iomanip>
 #include <random>
 
 namespace vio_360 {
@@ -36,17 +38,6 @@ Initializer::Initializer()
     m_max_reprojection_error = config.initialization_max_reprojection_error;
     m_init_grid_cols = config.initialization_grid_cols;
     m_init_grid_rows = config.initialization_grid_rows;
-    
-    std::cout << "\n[Initializer] Configuration loaded:" << std::endl;
-    std::cout << "  Camera: " << m_camera_width << "x" << m_camera_height << std::endl;
-    std::cout << "  Min features: " << m_min_features << std::endl;
-    std::cout << "  Min observations: " << m_min_observations << std::endl;
-    std::cout << "  Min parallax: " << m_min_parallax << " pixels" << std::endl;
-    std::cout << "  RANSAC threshold: " << m_ransac_threshold << " radians" << std::endl;
-    std::cout << "  RANSAC iterations: " << m_ransac_iterations << std::endl;
-    std::cout << "  Min inlier ratio: " << m_min_inlier_ratio << std::endl;
-    std::cout << "  Max reprojection error: " << m_max_reprojection_error << " pixels" << std::endl;
-    std::cout << "  Grid: " << m_init_grid_cols << "x" << m_init_grid_rows << std::endl;
 }
 
 void Initializer::Reset() {
@@ -57,25 +48,23 @@ bool Initializer::TryMonocularInitialization(
     const std::vector<std::shared_ptr<Frame>>& frames,
     InitializationResult& result
 ) {
-    std::cout << "\n========== Starting Monocular Initialization ==========" << std::endl;
-    
     // Reset result
     result = InitializationResult();
+    
+    if (frames.size() < 2) {
+        return false;
+    }
     
     // 1. Select features with sufficient observations
     auto selected_features = SelectFeaturesForInit(frames);
     
     if (selected_features.size() < static_cast<size_t>(m_min_features)) {
-        std::cout << "[Initializer] Not enough features selected" << std::endl;
         return false;
     }
     
-    // 2. Select frame pair
-    std::shared_ptr<Frame> frame1, frame2;
-    if (!SelectFramePair(selected_features, frame1, frame2)) {
-        std::cout << "[Initializer] Failed to select frame pair" << std::endl;
-        return false;
-    }
+    // 2. Use window's first and last frames directly
+    std::shared_ptr<Frame> frame1 = frames.front();
+    std::shared_ptr<Frame> frame2 = frames.back();
     
     // 3. Extract bearing vectors for corresponding features
     std::vector<Eigen::Vector3f> bearings1, bearings2;
@@ -119,11 +108,7 @@ bool Initializer::TryMonocularInitialization(
         bearings2.push_back(features2[feat_idx2]->GetBearing());
     }
     
-    std::cout << "\n[Initializer] Extracted " << bearings1.size() 
-              << " bearing correspondences" << std::endl;
-    
     if (bearings1.size() < 5) {
-        std::cout << "[Initializer] Not enough bearing correspondences" << std::endl;
         return false;
     }
     
@@ -132,7 +117,6 @@ bool Initializer::TryMonocularInitialization(
     std::vector<bool> inlier_mask;
     
     if (!ComputeEssentialMatrix(bearings1, bearings2, E, inlier_mask)) {
-        std::cout << "[Initializer] Failed to compute Essential matrix" << std::endl;
         return false;
     }
     
@@ -141,7 +125,6 @@ bool Initializer::TryMonocularInitialization(
     Eigen::Vector3f t;
     
     if (!RecoverPose(E, bearings1, bearings2, R, t, inlier_mask)) {
-        std::cout << "[Initializer] Failed to recover pose" << std::endl;
         return false;
     }
     
@@ -150,27 +133,77 @@ bool Initializer::TryMonocularInitialization(
     int num_triangulated = TriangulatePoints(bearings1, bearings2, R, t, points3d);
     
     if (num_triangulated < m_min_features) {
-        std::cout << "[Initializer] Not enough triangulated points (got " 
-                  << num_triangulated << ", need " << m_min_features << ")" << std::endl;
         return false;
     }
     
     // 7. Validate initialization quality
-    if (!ValidateInitialization(bearings1, bearings2, points3d, R, t, inlier_mask)) {
-        std::cout << "[Initializer] Validation failed" << std::endl;
+    float mean_reproj_error = 0.0f;
+    if (!ValidateInitialization(bearings1, bearings2, points3d, R, t, inlier_mask, mean_reproj_error)) {
         return false;
     }
     
-    // 8. Success! Mark as initialized
+    // 8. Normalize scale: median depth = 1.0 (like lightweight_vio)
+    float scale_factor = NormalizeScale(points3d, t);
+    
+    // 9. Set frame poses
+    // Essential matrix gives us camera-to-camera transformation T_c1c2
+    // T_c1c2 = [R | t]: transforms points from camera1 frame to camera2 frame
+    // We need to convert camera poses to body poses using T_BC (body-to-camera)
+    
+    // Get extrinsic transformation
+    Eigen::Matrix4f T_BC = frame1->GetTBC();  // body-to-camera
+    Eigen::Matrix4f T_CB = T_BC.inverse();    // camera-to-body
+    
+    // Camera1 is at world origin: T_wc1 = Identity
+    // Body1 pose: T_wb1 = T_wc1 * T_cb = T_cb
+    Eigen::Matrix4f T_wc1 = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f T_wb1 = T_wc1 * T_CB;
+    frame1->SetTwb(T_wb1);
+    frame1->SetKeyframe(true);
+    
+    // T_c1c2 = [R | t]: camera1 to camera2 transformation
+    // T_wc2 = T_wc1 * T_c1c2^(-1) = T_c2c1 (since T_wc1 = I)
+    // Actually: T_c1c2 transforms cam1 coords to cam2 coords
+    // So T_wc2 (cam2 pose in world) = T_c1c2^(-1) when world = cam1
+    Eigen::Matrix4f T_c1c2 = Eigen::Matrix4f::Identity();
+    T_c1c2.block<3, 3>(0, 0) = R;
+    T_c1c2.block<3, 1>(0, 3) = t;
+    Eigen::Matrix4f T_wc2 = T_c1c2.inverse();
+    
+    // Convert camera2 pose to body2 pose: T_wb2 = T_wc2 * T_cb
+    Eigen::Matrix4f T_wb2 = T_wc2 * T_CB;
+    frame2->SetTwb(T_wb2);
+    frame2->SetKeyframe(true);
+    
+    // Debug: verify camera centers
+    {
+        Eigen::Matrix4f T_wc1_check = frame1->GetTwc();
+        Eigen::Matrix4f T_wc2_check = frame2->GetTwc();
+        Eigen::Vector3f C1 = T_wc1_check.block<3, 1>(0, 3);
+        Eigen::Vector3f C2 = T_wc2_check.block<3, 1>(0, 3);
+        LOG_INFO("Init poses: C1=({:.4f},{:.4f},{:.4f}), C2=({:.4f},{:.4f},{:.4f}), baseline={:.4f}",
+                 C1.x(), C1.y(), C1.z(), C2.x(), C2.y(), C2.z(), (C1-C2).norm());
+    }
+    
+    // 10. Transform points to world frame (frame1 = world origin)
+    // points3d are already in frame1 coordinates = world coordinates
+    
+    // 11. Create MapPoints and register to frames
+    CreateMapPoints(frame1, frame2, points3d, selected_features, result);
+    
+    // 12. Success! Mark as initialized
     m_is_initialized = true;
     
-    // 9. Populate result structure
+    // 13. Populate result structure
     result.success = true;
     result.R = R;
     result.t = t;
     result.points3d = points3d;
     result.frame1_id = frame1->GetFrameId();
     result.frame2_id = frame2->GetFrameId();
+    result.scale_factor = scale_factor;
+    result.initialized_keyframes.push_back(frame1);
+    result.initialized_keyframes.push_back(frame2);
     
     // Collect track IDs for the triangulated points
     result.track_ids.clear();
@@ -179,22 +212,45 @@ bool Initializer::TryMonocularInitialization(
         result.track_ids.push_back(feat->GetFeatureId());
     }
     
+    // 12. Run Bundle Adjustment on two keyframes only
+    LOG_INFO("Running BA on 2 keyframes with {} MapPoints...", result.initialized_mappoints.size());
+    
+    Optimizer optimizer;
+    std::vector<std::shared_ptr<Frame>> keyframes = {frame1, frame2};
+    
+    // Log reprojection error BEFORE BA
+    double reproj1_before = ComputeFrameReprojectionError(frame1);
+    double reproj2_before = ComputeFrameReprojectionError(frame2);
+    LOG_INFO("  Before BA - Frame {}: {:.2f} px, Frame {}: {:.2f} px, avg: {:.2f} px",
+             frame1->GetFrameId(), reproj1_before, 
+             frame2->GetFrameId(), reproj2_before,
+             (reproj1_before + reproj2_before) / 2.0);
+    
+    BAResult ba_result = optimizer.RunFullBA(keyframes);
+    
+    if (ba_result.success) {
+        LOG_INFO("BA success: {} inliers, {} outliers, cost {:.4f} -> {:.4f}",
+                 ba_result.num_inliers, ba_result.num_outliers,
+                 ba_result.initial_cost, ba_result.final_cost);
+        
+        // Log reprojection error AFTER BA
+        double reproj1_after = ComputeFrameReprojectionError(frame1);
+        double reproj2_after = ComputeFrameReprojectionError(frame2);
+        LOG_INFO("  After BA  - Frame {}: {:.2f} px, Frame {}: {:.2f} px, avg: {:.2f} px",
+                 frame1->GetFrameId(), reproj1_after,
+                 frame2->GetFrameId(), reproj2_after,
+                 (reproj1_after + reproj2_after) / 2.0);
+    } else {
+        LOG_WARN("BA failed or not converged");
+    }
+    
     // Compute rotation angle for summary
     Eigen::AngleAxisf angle_axis(R);
     float angle_deg = angle_axis.angle() * 180.0f / M_PI;
     
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "    INITIALIZATION SUCCESS!" << std::endl;
-    std::cout << "========================================" << std::endl;
-    std::cout << "  Frame pair: " << frame1->GetFrameId() 
-              << " -> " << frame2->GetFrameId() 
-              << " (separation: " << (frame2->GetFrameId() - frame1->GetFrameId()) << " frames)" << std::endl;
-    std::cout << "  Triangulated points: " << num_triangulated << std::endl;
-    std::cout << "  Rotation: " << std::fixed << std::setprecision(3) 
-              << angle_deg << " degrees" << std::endl;
-    std::cout << "  Translation direction: [" << std::fixed << std::setprecision(3)
-              << t.x() << ", " << t.y() << ", " << t.z() << "]" << std::endl;
-    std::cout << "========================================\n" << std::endl;
+    LOG_INFO("Init success: frames {}->{}, {} pts, scale={:.4f}, rot={:.1f}°, mean_reproj={:.2f}px",
+             frame1->GetFrameId(), frame2->GetFrameId(),
+             result.initialized_mappoints.size(), scale_factor, angle_deg, mean_reproj_error);
     
     return true;
 }
@@ -263,16 +319,12 @@ std::vector<std::shared_ptr<Feature>> Initializer::SelectFeaturesForInit(
     std::vector<std::shared_ptr<Feature>> selected_features;
     
     if (frames.empty()) {
-        std::cout << "[Initializer] SelectFeatures: No frames provided" << std::endl;
         return selected_features;
     }
     
     // Get features from the last frame (they have all the observation history)
     auto last_frame = frames.back();
     const auto& all_features = last_frame->GetFeatures();
-    
-    std::cout << "\n[Initializer] Feature Selection:" << std::endl;
-    std::cout << "  Total features in last frame: " << all_features.size() << std::endl;
     
     // Filter by observation count
     std::vector<std::shared_ptr<Feature>> candidates;
@@ -283,12 +335,7 @@ std::vector<std::shared_ptr<Feature>> Initializer::SelectFeaturesForInit(
         }
     }
     
-    std::cout << "  Features with >= " << m_min_observations 
-              << " observations: " << candidates.size() << std::endl;
-    
     if (candidates.size() < static_cast<size_t>(m_min_features)) {
-        std::cout << "  [WARNING] Not enough features! Need at least " 
-                  << m_min_features << std::endl;
         return selected_features;
     }
     
@@ -328,9 +375,6 @@ std::vector<std::shared_ptr<Feature>> Initializer::SelectFeaturesForInit(
         }
     }
     
-    std::cout << "  Grid distribution: " << grid_cols << "x" << grid_rows 
-              << " (" << non_empty_cells << "/" << total_grids << " cells occupied)" << std::endl;
-    
     // Sample features from each cell
     const int max_per_cell = 5;  // Maximum features per cell
     
@@ -349,29 +393,6 @@ std::vector<std::shared_ptr<Feature>> Initializer::SelectFeaturesForInit(
             selected_features.push_back(grid[i][j]);
         }
     }
-    
-    // Print observation statistics
-    if (!selected_features.empty()) {
-        int min_obs = selected_features[0]->GetObservationCount();
-        int max_obs = selected_features[0]->GetObservationCount();
-        int total_obs = 0;
-        
-        for (const auto& feat : selected_features) {
-            int obs = feat->GetObservationCount();
-            min_obs = std::min(min_obs, obs);
-            max_obs = std::max(max_obs, obs);
-            total_obs += obs;
-        }
-        
-        float avg_obs = static_cast<float>(total_obs) / selected_features.size();
-        
-        std::cout << "  Selected features: " << selected_features.size() << std::endl;
-        std::cout << "  Observation stats: min=" << min_obs 
-                  << ", max=" << max_obs 
-                  << ", avg=" << std::fixed << std::setprecision(1) << avg_obs << std::endl;
-    }
-    
-    std::cout << std::endl;
     
     return selected_features;
 }
@@ -396,11 +417,6 @@ bool Initializer::SelectFramePair(
     frame1 = observations.front().frame;
     frame2 = observations.back().frame;
     
-    std::cout << "[Initializer] Selected frame pair:" << std::endl;
-    std::cout << "  Frame1 ID: " << frame1->GetFrameId() << std::endl;
-    std::cout << "  Frame2 ID: " << frame2->GetFrameId() << std::endl;
-    std::cout << "  Frame separation: " << (frame2->GetFrameId() - frame1->GetFrameId()) << " frames" << std::endl;
-    
     return true;
 }
 
@@ -411,27 +427,11 @@ bool Initializer::ComputeEssentialMatrix(
     std::vector<bool>& inlier_mask
 ) const {
     if (bearings1.size() != bearings2.size() || bearings1.size() < 5) {
-        std::cout << "[Initializer] ComputeEssentialMatrix: Need at least 5 correspondences" << std::endl;
         return false;
     }
     
     const size_t num_points = bearings1.size();
     inlier_mask.resize(num_points, false);
-    
-    std::cout << "\n[Initializer] Computing Essential Matrix:" << std::endl;
-    std::cout << "  Input correspondences: " << num_points << std::endl;
-    std::cout << "  RANSAC iterations: " << m_ransac_iterations << std::endl;
-    std::cout << "  RANSAC threshold: " << std::scientific << std::setprecision(3) 
-              << m_ransac_threshold << " radians (" 
-              << std::fixed << std::setprecision(2) << (m_ransac_threshold * 180.0f / M_PI) 
-              << " degrees)" << std::endl;
-    
-    // Debug: Print some sample bearing vectors
-    std::cout << "  Sample bearings:" << std::endl;
-    for (size_t i = 0; i < std::min(size_t(3), num_points); ++i) {
-        std::cout << "    [" << i << "] b1=" << bearings1[i].transpose() 
-                  << ", b2=" << bearings2[i].transpose() << std::endl;
-    }
     
     // RANSAC parameters
     const int min_samples = 8;  // Use 8-point algorithm (more stable than 5-point)
@@ -522,16 +522,6 @@ bool Initializer::ComputeEssentialMatrix(
             }
         }
         
-        // Debug: Print error statistics for first few iterations
-        if (iter < 3) {
-            std::sort(errors.begin(), errors.end());
-            std::cout << "  Iter " << iter << " errors (rad): min=" << std::scientific << std::setprecision(3) << errors[0] 
-                      << ", median=" << errors[errors.size()/2]
-                      << ", max=" << errors.back()
-                      << ", threshold=" << m_ransac_threshold
-                      << ", inliers=" << num_inliers << "/" << num_points << std::endl;
-        }
-        
         // 4. Update best model
         if (num_inliers > best_inliers) {
             best_inliers = num_inliers;
@@ -543,12 +533,7 @@ bool Initializer::ComputeEssentialMatrix(
     // Check if we have enough inliers
     float inlier_ratio = static_cast<float>(best_inliers) / num_points;
     
-    std::cout << "  Best inliers: " << best_inliers << "/" << num_points 
-              << " (" << std::fixed << std::setprecision(1) << (inlier_ratio * 100) << "%)" << std::endl;
-    
     if (inlier_ratio < m_min_inlier_ratio) {
-        std::cout << "  [FAIL] Inlier ratio too low! Minimum required: " 
-                  << (m_min_inlier_ratio * 100) << "%" << std::endl;
         return false;
     }
     
@@ -589,10 +574,6 @@ bool Initializer::ComputeEssentialMatrix(
     
     inlier_mask = best_mask;
     
-    std::cout << "  [SUCCESS] Essential matrix computed" << std::endl;
-    std::cout << "  E = \n" << E << std::endl;
-    std::cout << std::endl;
-    
     return true;
 }
 
@@ -604,15 +585,10 @@ bool Initializer::RecoverPose(
     Eigen::Vector3f& t,
     const std::vector<bool>& inlier_mask
 ) const {
-    std::cout << "\n[Initializer] Recovering Pose from Essential Matrix" << std::endl;
-    
     // 1. SVD decomposition: E = U * Σ * V^T
     Eigen::JacobiSVD<Eigen::Matrix3f> svd(E, Eigen::ComputeFullU | Eigen::ComputeFullV);
     Eigen::Matrix3f U = svd.matrixU();
     Eigen::Matrix3f V = svd.matrixV();
-    
-    std::cout << "  SVD decomposition complete" << std::endl;
-    std::cout << "  Singular values: " << svd.singularValues().transpose() << std::endl;
     
     // 2. Define W matrix for rotation extraction
     Eigen::Matrix3f W;
@@ -643,8 +619,6 @@ bool Initializer::RecoverPose(
     candidates[2] = {R2,  t1};
     candidates[3] = {R2, -t1};
     
-    std::cout << "  Generated 4 pose candidates" << std::endl;
-    
     // 4. Test each candidate with cheirality check
     int best_count = 0;
     int best_idx = -1;
@@ -658,9 +632,6 @@ bool Initializer::RecoverPose(
             inlier_mask
         );
         
-        std::cout << "  Candidate " << (i+1) << ": " << good_points 
-                  << " points pass cheirality check" << std::endl;
-        
         if (good_points > best_count) {
             best_count = good_points;
             best_idx = i;
@@ -668,53 +639,12 @@ bool Initializer::RecoverPose(
     }
     
     if (best_idx < 0 || best_count < 50) {
-        std::cout << "  [FAIL] Not enough valid points (need >= 50, got " 
-                  << best_count << ")" << std::endl;
         return false;
     }
     
     // 5. Select best pose
     R = candidates[best_idx].first;
     t = candidates[best_idx].second;
-    
-    // Count total inliers for ratio
-    int total_inliers = 0;
-    for (bool inlier : inlier_mask) {
-        if (inlier) total_inliers++;
-    }
-    
-    float valid_ratio = static_cast<float>(best_count) / total_inliers;
-    
-    std::cout << "  [SUCCESS] Selected candidate " << (best_idx + 1) << std::endl;
-    std::cout << "  Valid points: " << best_count << "/" << total_inliers 
-              << " (" << std::fixed << std::setprecision(1) << (valid_ratio * 100) << "%)" << std::endl;
-    
-    // Print R with higher precision
-    std::cout << "  R = " << std::endl;
-    for (int i = 0; i < 3; ++i) {
-        std::cout << "    ";
-        for (int j = 0; j < 3; ++j) {
-            std::cout << std::setw(10) << std::fixed << std::setprecision(6) << R(i, j);
-        }
-        std::cout << std::endl;
-    }
-    
-    // Print t with higher precision
-    std::cout << "  t = ";
-    for (int i = 0; i < 3; ++i) {
-        std::cout << std::setw(10) << std::fixed << std::setprecision(6) << t(i);
-    }
-    std::cout << " (unit vector, ||t|| = " << std::fixed << std::setprecision(6) 
-              << t.norm() << ")" << std::endl;
-    
-    // Compute rotation angle
-    Eigen::AngleAxisf angle_axis(R);
-    float angle_deg = angle_axis.angle() * 180.0f / M_PI;
-    std::cout << "  Rotation angle: " << std::fixed << std::setprecision(3) 
-              << angle_deg << " degrees" << std::endl;
-    std::cout << "  Rotation axis: " << angle_axis.axis().transpose() << std::endl;
-    
-    std::cout << std::endl;
     
     return true;
 }
@@ -726,15 +656,10 @@ int Initializer::TriangulatePoints(
     const Eigen::Vector3f& t,
     std::vector<Eigen::Vector3f>& points3d
 ) const {
-    std::cout << "\n[Initializer] Triangulating 3D points" << std::endl;
-    std::cout << "  Input correspondences: " << bearings1.size() << std::endl;
-    
     points3d.clear();
     points3d.reserve(bearings1.size());
     
     int success_count = 0;
-    std::vector<float> depths;
-    depths.reserve(bearings1.size());
     
     for (size_t i = 0; i < bearings1.size(); ++i) {
         Eigen::Vector3f point3d;
@@ -748,7 +673,6 @@ int Initializer::TriangulatePoints(
             
             if (depth1 > 0 && depth2 > 0) {
                 points3d.push_back(point3d);
-                depths.push_back(depth1);
                 success_count++;
             } else {
                 points3d.push_back(Eigen::Vector3f::Zero());  // Mark as invalid
@@ -756,23 +680,6 @@ int Initializer::TriangulatePoints(
         } else {
             points3d.push_back(Eigen::Vector3f::Zero());  // Triangulation failed
         }
-    }
-    
-    // Compute statistics
-    if (!depths.empty()) {
-        std::sort(depths.begin(), depths.end());
-        float min_depth = depths.front();
-        float median_depth = depths[depths.size() / 2];
-        float max_depth = depths.back();
-        
-        std::cout << "  Successfully triangulated: " << success_count 
-                  << "/" << bearings1.size() << std::endl;
-        std::cout << "  Depth statistics (frame1):" << std::endl;
-        std::cout << "    Min: " << std::fixed << std::setprecision(3) << min_depth << std::endl;
-        std::cout << "    Median: " << median_depth << std::endl;
-        std::cout << "    Max: " << max_depth << std::endl;
-    } else {
-        std::cout << "  [WARNING] No points successfully triangulated!" << std::endl;
     }
     
     return success_count;
@@ -909,13 +816,13 @@ bool Initializer::ValidateInitialization(
     const std::vector<Eigen::Vector3f>& points3d,
     const Eigen::Matrix3f& R,
     const Eigen::Vector3f& t,
-    const std::vector<bool>& inlier_mask
+    const std::vector<bool>& inlier_mask,
+    float& mean_error
 ) const {
-    std::cout << "\n[Initializer] Validating initialization" << std::endl;
-    
     int valid_count = 0;
     int total_inliers = 0;
     std::vector<float> errors_pixel;
+    float error_sum = 0.0f;
     
     for (size_t i = 0; i < points3d.size(); ++i) {
         if (!inlier_mask[i]) continue;
@@ -928,6 +835,7 @@ bool Initializer::ValidateInitialization(
         float error_pixel = ComputeReprojectionError(points3d[i], bearings2[i], R, t);
         
         errors_pixel.push_back(error_pixel);
+        error_sum += error_pixel;
         
         if (error_pixel < m_max_reprojection_error) {
             valid_count++;
@@ -935,50 +843,301 @@ bool Initializer::ValidateInitialization(
     }
     
     if (errors_pixel.empty()) {
-        std::cout << "  [FAIL] No valid points to validate!" << std::endl;
+        mean_error = 0.0f;
         return false;
     }
     
+    // Compute mean error
+    mean_error = error_sum / errors_pixel.size();
+    
     // Compute statistics
     std::sort(errors_pixel.begin(), errors_pixel.end());
-    
-    float median_error_pixel = errors_pixel[errors_pixel.size() / 2];
-    float max_error_pixel = errors_pixel.back();
-    float mean_error_pixel = 0.0f;
-    for (float e : errors_pixel) mean_error_pixel += e;
-    mean_error_pixel /= errors_pixel.size();
-    
     float valid_ratio = static_cast<float>(valid_count) / total_inliers;
-    
-    std::cout << "  Reprojection error statistics (pixels):" << std::endl;
-    std::cout << "    Min: " << std::fixed << std::setprecision(2) 
-              << errors_pixel.front() << " px" << std::endl;
-    std::cout << "    Median: " << std::fixed << std::setprecision(2) 
-              << median_error_pixel << " px" << std::endl;
-    std::cout << "    Mean: " << std::fixed << std::setprecision(2) 
-              << mean_error_pixel << " px" << std::endl;
-    std::cout << "    Max: " << std::fixed << std::setprecision(2) 
-              << max_error_pixel << " px" << std::endl;
-    std::cout << "    Threshold: " << m_max_reprojection_error << " px" << std::endl;
-    std::cout << "  Valid points: " << valid_count << "/" << total_inliers 
-              << " (" << std::fixed << std::setprecision(1) << (valid_ratio * 100) << "%)" << std::endl;
     
     // Validation check 1: Inlier ratio
     if (valid_ratio < m_min_inlier_ratio) {
-        std::cout << "  [FAIL] Valid ratio too low! Required: >= " 
-                  << std::fixed << std::setprecision(1) << (m_min_inlier_ratio * 100) << "%" << std::endl;
         return false;
     }
     
     // Validation check 2: Minimum number of points
     if (valid_count < m_min_features) {
-        std::cout << "  [FAIL] Not enough valid points! Required: >= " 
-                  << m_min_features << std::endl;
         return false;
     }
     
-    std::cout << "  [SUCCESS] Validation passed!" << std::endl;
     return true;
+}
+
+float Initializer::NormalizeScale(
+    std::vector<Eigen::Vector3f>& points3d,
+    Eigen::Vector3f& t
+) const {
+    if (points3d.empty()) {
+        return 1.0f;
+    }
+    
+    // Collect depths (Z-coordinate in frame1 = forward direction)
+    // For 360 camera, depth is the distance from camera center
+    std::vector<float> depths;
+    depths.reserve(points3d.size());
+    
+    for (const auto& pt : points3d) {
+        // Skip invalid points (zero vector)
+        if (pt.norm() < 1e-6f) continue;
+        
+        // For 360 camera: depth = distance from origin
+        float depth = pt.norm();
+        if (depth > 0.01f) {  // Valid depth
+            depths.push_back(depth);
+        }
+    }
+    
+    if (depths.empty()) {
+        return 1.0f;
+    }
+    
+    // Compute median depth
+    std::sort(depths.begin(), depths.end());
+    float median_depth;
+    size_t mid = depths.size() / 2;
+    if (depths.size() % 2 == 0) {
+        median_depth = (depths[mid - 1] + depths[mid]) / 2.0f;
+    } else {
+        median_depth = depths[mid];
+    }
+    
+    // Scale factor to normalize median depth to 1.0
+    float scale_factor = 1.0f / median_depth;
+    
+    // Scale all 3D points
+    for (auto& pt : points3d) {
+        pt *= scale_factor;
+    }
+    
+    // Scale translation vector
+    t *= scale_factor;
+    
+    return scale_factor;
+}
+
+void Initializer::CreateMapPoints(
+    std::shared_ptr<Frame> frame1,
+    std::shared_ptr<Frame> frame2,
+    const std::vector<Eigen::Vector3f>& points3d,
+    const std::vector<std::shared_ptr<Feature>>& selected_features,
+    InitializationResult& result
+) {
+    // Initialize map_points vectors in frames
+    frame1->InitializeMapPoints();
+    frame2->InitializeMapPoints();
+    
+    const auto& features1 = frame1->GetFeatures();
+    const auto& features2 = frame2->GetFeatures();
+    
+    result.initialized_mappoints.clear();
+    
+    int created_count = 0;
+    
+    for (size_t i = 0; i < selected_features.size() && i < points3d.size(); ++i) {
+        const auto& feat = selected_features[i];
+        const Eigen::Vector3f& point_world = points3d[i];
+        
+        // Skip invalid points
+        if (point_world.norm() < 1e-6f) continue;
+        
+        int feature_id = feat->GetFeatureId();
+        
+        // Find feature indices in both frames
+        int feat_idx1 = -1, feat_idx2 = -1;
+        
+        for (size_t j = 0; j < features1.size(); ++j) {
+            if (features1[j]->GetFeatureId() == feature_id) {
+                feat_idx1 = static_cast<int>(j);
+                break;
+            }
+        }
+        
+        for (size_t j = 0; j < features2.size(); ++j) {
+            if (features2[j]->GetFeatureId() == feature_id) {
+                feat_idx2 = static_cast<int>(j);
+                break;
+            }
+        }
+        
+        // Skip if not found in both frames
+        if (feat_idx1 < 0 || feat_idx2 < 0) continue;
+        
+        // Create MapPoint
+        auto mp = std::make_shared<MapPoint>(point_world);
+        
+        // Register to frames
+        frame1->SetMapPoint(feat_idx1, mp);
+        frame2->SetMapPoint(feat_idx2, mp);
+        
+        // Add observations
+        mp->AddObservation(frame1, feat_idx1);
+        mp->AddObservation(frame2, feat_idx2);
+        
+        result.initialized_mappoints.push_back(mp);
+        created_count++;
+    }
+}
+
+void Initializer::InterpolateIntermediateFrames(
+    const std::vector<std::shared_ptr<Frame>>& frames,
+    const std::vector<std::shared_ptr<MapPoint>>& mappoints
+) {
+    if (frames.size() < 3) {
+        return;  // No intermediate frames to interpolate
+    }
+    
+    // Get keyframe poses (first and last)
+    auto frame1 = frames.front();
+    auto frame2 = frames.back();
+    Eigen::Matrix4f T1 = frame1->GetTwb();
+    Eigen::Matrix4f T2 = frame2->GetTwb();
+    
+    int num_frames = static_cast<int>(frames.size());
+    int num_intermediate = num_frames - 2;
+    
+    // Interpolate intermediate frames and set as keyframes
+    for (int i = 1; i < num_frames - 1; ++i) {
+        auto& frame = frames[i];
+        
+        // Interpolation parameter: t in [0, 1]
+        float t = static_cast<float>(i) / static_cast<float>(num_frames - 1);
+        
+        // Interpolate pose using SLERP for rotation, LERP for translation
+        Eigen::Matrix4f T_interp = InterpolatePose(T1, T2, t);
+        frame->SetTwb(T_interp);
+        frame->SetKeyframe(true);  // Mark as keyframe
+    }
+    
+    // Register MapPoint observations in intermediate frames
+    int total_obs = 0;
+    for (const auto& mp : mappoints) {
+        Eigen::Vector3f point_world = mp->GetPosition();
+        
+        // For each intermediate frame
+        for (int i = 1; i < num_frames - 1; ++i) {
+            auto& frame = frames[i];
+            const auto& features = frame->GetFeatures();
+            
+            // Find if this MapPoint's feature is tracked in this frame
+            // MapPoint has observations from frame1 and frame2
+            // We need to find the corresponding feature in intermediate frames by track_id
+            
+            const auto& observations = mp->GetObservations();
+            if (observations.empty()) continue;
+            
+            // Get the feature_id (track_id) from one of the observations
+            int track_id = -1;
+            for (const auto& obs : observations) {
+                auto obs_frame = obs.frame.lock();
+                if (obs_frame && obs.feature_index >= 0 && 
+                    obs.feature_index < static_cast<int>(obs_frame->GetFeatures().size())) {
+                    track_id = obs_frame->GetFeatures()[obs.feature_index]->GetFeatureId();
+                    break;
+                }
+            }
+            
+            if (track_id < 0) continue;
+            
+            // Find feature with same track_id in current frame
+            for (size_t j = 0; j < features.size(); ++j) {
+                if (features[j]->GetFeatureId() == track_id) {
+                    // Check if this point is visible from this frame (positive depth)
+                    Eigen::Matrix4f Twb = frame->GetTwb();
+                    Eigen::Matrix4f Tbw = Twb.inverse();
+                    Eigen::Vector3f point_cam = Tbw.block<3, 3>(0, 0) * point_world + 
+                                                 Tbw.block<3, 1>(0, 3);
+                    
+                    // For 360 camera, depth is the distance from camera center
+                    float depth = point_cam.norm();
+                    
+                    if (depth > 0.01f) {  // Valid depth
+                        // Register observation
+                        frame->SetMapPoint(static_cast<int>(j), mp);
+                        mp->AddObservation(frame, static_cast<int>(j));
+                        total_obs++;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    
+    LOG_INFO("Interpolated {} intermediate frames, added {} MapPoint observations",
+             num_intermediate, total_obs);
+}
+
+double Initializer::ComputeFrameReprojectionError(const std::shared_ptr<Frame>& frame) const {
+    if (!frame) return 0.0;
+    
+    // Get camera extrinsics
+    Eigen::Matrix4f Twb = frame->GetTwb();
+    Eigen::Matrix4f Tcb = frame->GetTCB();
+    
+    // Compute Tcw = Tcb * Tbw = Tcb * Twb^(-1)
+    Eigen::Matrix4f Tbw = Twb.inverse();
+    Eigen::Matrix4f Tcw = Tcb * Tbw;
+    Eigen::Matrix3f Rcw = Tcw.block<3, 3>(0, 0);
+    Eigen::Vector3f tcw = Tcw.block<3, 1>(0, 3);
+    
+    double cols = static_cast<double>(frame->GetWidth());
+    double rows = static_cast<double>(frame->GetHeight());
+    
+    const auto& features = frame->GetFeatures();
+    double total_error = 0.0;
+    int count = 0;
+    
+    for (size_t i = 0; i < features.size(); ++i) {
+        auto mp = frame->GetMapPoint(static_cast<int>(i));
+        if (!mp || mp->IsBad()) continue;
+        
+        const auto& feature = features[i];
+        if (!feature || !feature->IsValid()) continue;
+        
+        // Get observed pixel coordinate
+        cv::Point2f obs_pt = feature->GetPixelCoord();
+        double obs_u = obs_pt.x;
+        double obs_v = obs_pt.y;
+        
+        // Get MapPoint position in world frame
+        Eigen::Vector3f pw = mp->GetPosition();
+        
+        // Transform to camera frame
+        Eigen::Vector3f pc = Rcw * pw + tcw;
+        double pcx = pc.x();
+        double pcy = pc.y();
+        double pcz = pc.z();
+        double L = pc.norm();
+        
+        if (L < 1e-6) continue;
+        
+        // Equirectangular projection - MUST match Camera.cpp PixelToBearing!
+        // Camera.cpp: x=cos(lat)*cos(lon), y=cos(lat)*sin(lon), z=sin(lat)
+        // So: lon=atan2(y,x), lat=atan2(z, sqrt(x²+y²))
+        double lon = std::atan2(pcy, pcx);  // [-π, π]
+        double lat = std::atan2(pcz, std::sqrt(pcx*pcx + pcy*pcy));  // [-π/2, π/2]
+        
+        // u = (lon + π) / (2π) * cols, v = (π/2 - lat) / π * rows
+        double proj_u = (lon + M_PI) / (2.0 * M_PI) * cols;
+        double proj_v = (M_PI / 2.0 - lat) / M_PI * rows;
+        
+        // Compute pixel error
+        double du = obs_u - proj_u;
+        double dv = obs_v - proj_v;
+        
+        // Handle wraparound for u (horizontal)
+        if (du > cols / 2.0) du -= cols;
+        if (du < -cols / 2.0) du += cols;
+        
+        double error = std::sqrt(du * du + dv * dv);
+        total_error += error;
+        count++;
+    }
+    
+    return (count > 0) ? (total_error / count) : 0.0;
 }
 
 } // namespace vio_360

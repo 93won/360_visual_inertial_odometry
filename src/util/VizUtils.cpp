@@ -1,7 +1,8 @@
 /**
  * @file      VizUtils.cpp
  * @brief     Visualization utilities implementation
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -13,14 +14,18 @@
 #include "Estimator.h"
 #include "Frame.h"
 #include "Feature.h"
+#include "MapPoint.h"
 #include <iostream>
+#include <GL/glu.h>
+#include <set>
 
 namespace vio_360 {
 
 VizUtils::VizUtils(int window_width, int window_height)
     : m_window_width(window_width)
     , m_window_height(window_height)
-    , m_paused(false) {
+    , m_paused(false)
+    , m_step_requested(false) {
 }
 
 VizUtils::~VizUtils() {
@@ -34,14 +39,18 @@ void VizUtils::Initialize() {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     
     // Define Projection and initial ModelView matrix
+    // 3D view will be on the right side (1920-640 = 1280 width, 1080 height)
+    const int UI_WIDTH = 640;
+    const int view_width = m_window_width - UI_WIDTH;   // 1280
+    const int view_height = m_window_height;             // 1080
+    
     m_s_cam = std::make_unique<pangolin::OpenGlRenderState>(
-        pangolin::ProjectionMatrix(m_window_width, m_window_height, 500, 500, 
-                                   m_window_width/2, m_window_height/2, 0.1, 1000),
+        pangolin::ProjectionMatrix(view_width, view_height, 500, 500, 
+                                   view_width/2, view_height/2, 0.1, 1000),
         pangolin::ModelViewLookAt(0, -5, -10, 0, 0, 0, pangolin::AxisZ)
     );
     
     // Create Interactive View in window
-    const int UI_WIDTH = 640;
     const int IMAGE_HEIGHT = 360;
     
     // UI Panel (left side, top part)
@@ -76,8 +85,7 @@ void VizUtils::Initialize() {
     m_follow_camera = std::make_unique<pangolin::Var<bool>>("ui.Follow Camera", true, true);
     m_point_size = std::make_unique<pangolin::Var<int>>("ui.Point Size", 2, 1, 10);
     m_pause_button = std::make_unique<pangolin::Var<bool>>("ui.Pause", false, false);
-    
-    std::cout << "[VIZUTILS] Initialized" << std::endl;
+    m_step_button = std::make_unique<pangolin::Var<bool>>("ui.Step", false, false);
 }
 
 void VizUtils::Update(const Estimator* estimator, 
@@ -88,7 +96,13 @@ void VizUtils::Update(const Estimator* estimator,
     // Check pause button
     if (pangolin::Pushed(*m_pause_button)) {
         m_paused = !m_paused;
-        std::cout << "[VIZUTILS] " << (m_paused ? "Paused" : "Resumed") << std::endl;
+    }
+    
+    // Check step button (only works when paused)
+    if (pangolin::Pushed(*m_step_button)) {
+        if (m_paused) {
+            m_step_requested = true;
+        }
     }
     
     // Clear screen with black background
@@ -156,28 +170,34 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
     // Draw coordinate axis
     DrawAxis(1.0f);
     
-    // Draw initialization result if available
+    // Draw MapPoints from all keyframes
     if (*m_show_init_result && estimator->IsInitialized()) {
-        const auto& init_points = estimator->GetInitializedPoints();
-        const auto& init_poses = estimator->GetInitializationPoses();
+        const auto& keyframes = estimator->GetKeyframes();
         
-        // Draw initialized 3D points
-        if (!init_points.empty()) {
+        // Collect unique MapPoints from all keyframes
+        std::set<std::shared_ptr<MapPoint>> unique_mappoints;
+        for (const auto& kf : keyframes) {
+            const auto& features = kf->GetFeatures();
+            for (size_t i = 0; i < features.size(); ++i) {
+                auto mp = kf->GetMapPoint(static_cast<int>(i));
+                if (mp && !mp->IsBad()) {
+                    unique_mappoints.insert(mp);
+                }
+            }
+        }
+        
+        // Draw MapPoints
+        if (!unique_mappoints.empty()) {
             glPointSize(static_cast<float>(*m_point_size) * 2.0f);
             glBegin(GL_POINTS);
-            glColor3f(0.0f, 1.0f, 0.0f);  // Green for initialized points
+            glColor3f(0.0f, 1.0f, 0.0f);  // Green for MapPoints
             
-            for (const auto& pt : init_points) {
+            for (const auto& mp : unique_mappoints) {
+                Eigen::Vector3f pt = mp->GetPosition();
                 glVertex3f(pt.x(), pt.y(), pt.z());
             }
             
             glEnd();
-        }
-        
-        // Draw initialization camera poses
-        if (init_poses.size() >= 2) {
-            DrawCamera(init_poses[0], 1.0f, 1.0f, 0.0f, 0.15f);  // Yellow for frame 1
-            DrawCamera(init_poses[1], 1.0f, 0.5f, 0.0f, 0.15f);  // Orange for frame 2
         }
     }
     
@@ -187,25 +207,56 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
         DrawTrajectory(frames);
     }
     
-    // Draw keyframes
-    if (*m_show_keyframes) {
-        // TODO: Get keyframes from estimator
-        // DrawKeyframes(keyframes);
-    }
-    
-    // Draw current camera
-    auto current_frame = estimator->GetCurrentFrame();
-    if (current_frame) {
-        Eigen::Matrix4f T_wc = current_frame->GetTwc();
-        DrawCamera(T_wc, 0.0f, 1.0f, 0.0f, 0.1f);  // Green for current
+    // Draw keyframes as spheres
+    if (*m_show_keyframes && estimator->IsInitialized()) {
+        const auto& keyframes = estimator->GetKeyframes();
+        for (size_t i = 0; i < keyframes.size(); ++i) {
+            const auto& kf = keyframes[i];
+            
+            Eigen::Matrix4f T_wb = kf->GetTwb();
+            Eigen::Vector3f pos = T_wb.block<3, 1>(0, 3);
+            
+            // All keyframes mint color
+            glColor3f(0.0f, 0.9f, 0.7f);  // Mint color for keyframes
+            
+            // Draw wireframe sphere
+            glPushMatrix();
+            glTranslatef(pos.x(), pos.y(), pos.z());
+            GLUquadric* quad = gluNewQuadric();
+            gluQuadricDrawStyle(quad, GLU_LINE);  // Wireframe style
+            gluSphere(quad, 0.15, 12, 8);  // radius=0.15 (10x larger), slices=12, stacks=8
+            gluDeleteQuadric(quad);
+            glPopMatrix();
+        }
     }
     
     // Follow camera if enabled
-    if (*m_follow_camera && current_frame) {
-        Eigen::Matrix4f T_wc = current_frame->GetTwc();
-        Eigen::Vector3f pos = T_wc.block<3, 1>(0, 3);
+    auto current_frame = estimator->GetCurrentFrame();
+    if (*m_follow_camera && current_frame && estimator->IsInitialized()) {
+        Eigen::Matrix4f T_wb = current_frame->GetTwb();
+        Eigen::Vector3f pos = T_wb.block<3, 1>(0, 3);
         
         m_s_cam->Follow(pangolin::OpenGlMatrix::Translate(pos.x(), pos.y(), pos.z()));
+    }
+    
+    // Draw current frame position as RED wireframe sphere (tracking indicator)
+    if (current_frame && estimator->IsInitialized()) {
+        Eigen::Matrix4f T_wb = current_frame->GetTwb();
+        Eigen::Vector3f pos = T_wb.block<3, 1>(0, 3);
+        
+        glColor3f(1.0f, 0.0f, 0.0f);  // Red for current frame
+        glLineWidth(3.0f);  // Thicker wireframe
+        
+        // Draw wireframe sphere for current frame
+        glPushMatrix();
+        glTranslatef(pos.x(), pos.y(), pos.z());
+        GLUquadric* quad = gluNewQuadric();
+        gluQuadricDrawStyle(quad, GLU_LINE);  // Wireframe style
+        gluSphere(quad, 0.2, 16, 12);  // radius=0.2 (10x larger), slices=16, stacks=12
+        gluDeleteQuadric(quad);
+        glPopMatrix();
+        
+        glLineWidth(1.0f);  // Reset line width
     }
 }
 
@@ -217,8 +268,8 @@ void VizUtils::DrawTrajectory(const std::vector<std::shared_ptr<Frame>>& frames)
     glBegin(GL_LINE_STRIP);
     
     for (const auto& frame : frames) {
-        Eigen::Matrix4f T_wc = frame->GetTwc();
-        Eigen::Vector3f pos = T_wc.block<3, 1>(0, 3);
+        Eigen::Matrix4f T_wb = frame->GetTwb();
+        Eigen::Vector3f pos = T_wb.block<3, 1>(0, 3);
         glVertex3f(pos.x(), pos.y(), pos.z());
     }
     
@@ -227,53 +278,76 @@ void VizUtils::DrawTrajectory(const std::vector<std::shared_ptr<Frame>>& frames)
 
 void VizUtils::DrawKeyframes(const std::vector<std::shared_ptr<Frame>>& keyframes) {
     for (const auto& kf : keyframes) {
-        Eigen::Matrix4f T_wc = kf->GetTwc();
-        DrawCamera(T_wc, 0.0f, 0.0f, 1.0f, 0.05f);  // Blue for keyframes
+        Eigen::Matrix4f T_wb = kf->GetTwb();
+        DrawCamera(T_wb, 0.0f, 0.0f, 1.0f, 0.05f);  // Blue for keyframes
     }
 }
 
-void VizUtils::DrawCamera(const Eigen::Matrix4f& T_wc, float r, float g, float b, float size) {
-    const float w = size;
-    const float h = w * 0.75f;
-    const float z = w * 0.6f;
-    
+void VizUtils::DrawCamera(const Eigen::Matrix4f& T_wb, float r, float g, float b, float size) {
     glPushMatrix();
     
-    // Apply transformation
-    Eigen::Matrix4f T_cw = T_wc.inverse();
-    glMultMatrixf(T_cw.data());
+    // Apply transformation (World to Body)
+    Eigen::Matrix4f T_bw = T_wb.inverse();
+    glMultMatrixf(T_bw.data());
     
-    glLineWidth(2.0f);
+    glLineWidth(1.5f);
     glColor3f(r, g, b);
     
-    // Draw camera frustum
+    // Draw wireframe sphere to represent 360 camera
+    const float radius = size;
+    const int slices = 16;  // Longitudinal divisions
+    const int stacks = 8;   // Latitudinal divisions
+    
+    // Draw latitude circles
+    for (int i = 0; i <= stacks; ++i) {
+        float lat = M_PI * (-0.5f + (float)i / stacks);
+        float z = radius * std::sin(lat);
+        float r_lat = radius * std::cos(lat);
+        
+        glBegin(GL_LINE_LOOP);
+        for (int j = 0; j <= slices; ++j) {
+            float lon = 2.0f * M_PI * (float)j / slices;
+            float x = r_lat * std::cos(lon);
+            float y = r_lat * std::sin(lon);
+            glVertex3f(x, y, z);
+        }
+        glEnd();
+    }
+    
+    // Draw longitude circles
+    for (int j = 0; j < slices; ++j) {
+        float lon = 2.0f * M_PI * (float)j / slices;
+        
+        glBegin(GL_LINE_STRIP);
+        for (int i = 0; i <= stacks; ++i) {
+            float lat = M_PI * (-0.5f + (float)i / stacks);
+            float z = radius * std::sin(lat);
+            float r_lat = radius * std::cos(lat);
+            float x = r_lat * std::cos(lon);
+            float y = r_lat * std::sin(lon);
+            glVertex3f(x, y, z);
+        }
+        glEnd();
+    }
+    
+    // Draw a small axis at camera center to show orientation
+    glLineWidth(2.0f);
     glBegin(GL_LINES);
     
-    // Camera center to corners
+    // X axis - Red
+    glColor3f(1.0f, 0.2f, 0.2f);
     glVertex3f(0, 0, 0);
-    glVertex3f(w, h, z);
+    glVertex3f(radius * 0.5f, 0, 0);
     
+    // Y axis - Green
+    glColor3f(0.2f, 1.0f, 0.2f);
     glVertex3f(0, 0, 0);
-    glVertex3f(w, -h, z);
+    glVertex3f(0, radius * 0.5f, 0);
     
+    // Z axis - Blue (forward direction)
+    glColor3f(0.2f, 0.2f, 1.0f);
     glVertex3f(0, 0, 0);
-    glVertex3f(-w, -h, z);
-    
-    glVertex3f(0, 0, 0);
-    glVertex3f(-w, h, z);
-    
-    // Image plane rectangle
-    glVertex3f(w, h, z);
-    glVertex3f(w, -h, z);
-    
-    glVertex3f(w, -h, z);
-    glVertex3f(-w, -h, z);
-    
-    glVertex3f(-w, -h, z);
-    glVertex3f(-w, h, z);
-    
-    glVertex3f(-w, h, z);
-    glVertex3f(w, h, z);
+    glVertex3f(0, 0, radius * 0.5f);
     
     glEnd();
     
@@ -342,11 +416,31 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
     
     const auto& features = current_frame->GetFeatures();
     
+    // Check if system is initialized (has any MapPoints)
+    bool has_mappoints = false;
+    for (size_t i = 0; i < features.size(); ++i) {
+        auto mp = current_frame->GetMapPoint(static_cast<int>(i));
+        if (mp && !mp->IsBad()) {
+            has_mappoints = true;
+            break;
+        }
+    }
+    
     // Draw tracking lines
     if (previous_frame) {
         const auto& prev_features = previous_frame->GetFeatures();
         
-        for (const auto& feature : features) {
+        for (size_t i = 0; i < features.size(); ++i) {
+            const auto& feature = features[i];
+            
+            // After initialization: only draw inliers with valid MapPoints
+            if (has_mappoints) {
+                auto mp = current_frame->GetMapPoint(static_cast<int>(i));
+                if (!mp || mp->IsBad()) {
+                    continue;  // Skip outliers
+                }
+            }
+            
             if (feature->HasTrackedFeature()) {
                 for (const auto& prev_feature : prev_features) {
                     if (prev_feature->GetFeatureId() == feature->GetTrackedFeatureId()) {
@@ -363,17 +457,29 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
     }
     
     // Draw feature points
-    for (const auto& feature : features) {
+    int inlier_count = 0;
+    for (size_t i = 0; i < features.size(); ++i) {
+        const auto& feature = features[i];
+        
+        // After initialization: only draw inliers with valid MapPoints
+        if (has_mappoints) {
+            auto mp = current_frame->GetMapPoint(static_cast<int>(i));
+            if (!mp || mp->IsBad()) {
+                continue;  // Skip outliers
+            }
+        }
+        
         cv::Point2f pt = feature->GetPixelCoord();
         cv::Scalar color = GetColorFromAge(feature->GetAge(), 10);
         cv::circle(vis_image, pt, 3, color, -1, cv::LINE_AA);
+        inlier_count++;
     }
     
     // Add text information
     cv::putText(vis_image, "360 VIO Tracking", cv::Point(10, 30),
                cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
     
-    std::string info = "Features: " + std::to_string(features.size());
+    std::string info = "Inliers: " + std::to_string(inlier_count) + " / " + std::to_string(features.size());
     cv::putText(vis_image, info, cv::Point(10, 60),
                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
     

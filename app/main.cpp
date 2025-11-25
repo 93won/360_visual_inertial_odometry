@@ -1,7 +1,8 @@
 /**
  * @file      main.cpp
  * @brief     360-degree VIO demo
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -14,20 +15,93 @@
 #include "Feature.h"
 #include "ConfigUtils.h"
 #include "VizUtils.h"
+#include "Logger.h"
 #include <opencv2/opencv.hpp>
-#include <iostream>
-#include <iomanip>
 #include <vector>
 #include <string>
 #include <filesystem>
 #include <chrono>
 #include <thread>
+#include <fstream>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
-/**
- * @brief Get sorted list of image files from directory
- */
+std::vector<double> LoadCameraTimestamps(const std::string& filepath) {
+    std::vector<double> timestamps;
+    std::ifstream file(filepath);
+    
+    if (!file.is_open()) {
+        LOG_ERROR("Failed to open {}", filepath);
+        return timestamps;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        try {
+            timestamps.push_back(std::stod(line));
+        } catch (...) {}
+    }
+    
+    return timestamps;
+}
+
+std::vector<vio_360::IMUData> LoadIMUData(const std::string& filepath) {
+    std::vector<vio_360::IMUData> imu_data;
+    std::ifstream file(filepath);
+    
+    if (!file.is_open()) {
+        LOG_ERROR("Failed to open {}", filepath);
+        return imu_data;
+    }
+    
+    std::string line;
+    std::getline(file, line);  // Skip header
+    
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        
+        std::stringstream ss(line);
+        std::string item;
+        std::vector<std::string> tokens;
+        
+        while (std::getline(ss, item, ',')) {
+            tokens.push_back(item);
+        }
+        
+        if (tokens.size() != 7) continue;
+        
+        try {
+            vio_360::IMUData imu;
+            imu.timestamp = std::stod(tokens[0]);
+            imu.ax = std::stof(tokens[1]);
+            imu.ay = std::stof(tokens[2]);
+            imu.az = std::stof(tokens[3]);
+            imu.gx = std::stof(tokens[4]);
+            imu.gy = std::stof(tokens[5]);
+            imu.gz = std::stof(tokens[6]);
+            imu_data.push_back(imu);
+        } catch (...) {}
+    }
+    
+    return imu_data;
+}
+
+std::vector<vio_360::IMUData> GetIMUBetweenTimestamps(
+    const std::vector<vio_360::IMUData>& all_imu_data,
+    double start_time,
+    double end_time
+) {
+    std::vector<vio_360::IMUData> filtered_imu;
+    for (const auto& imu : all_imu_data) {
+        if (imu.timestamp >= start_time && imu.timestamp < end_time) {
+            filtered_imu.push_back(imu);
+        }
+    }
+    return filtered_imu;
+}
+
 std::vector<std::string> GetImageFiles(const std::string& directory) {
     std::vector<std::string> image_files;
     
@@ -45,123 +119,118 @@ std::vector<std::string> GetImageFiles(const std::string& directory) {
 }
 
 int main(int argc, char** argv) {
-    // Parse arguments
+    vio_360::Logger::Init();
+    
     if (argc < 2) {
-        std::cout << "Usage: " << argv[0] << " <images_directory> [config_file]" << std::endl;
-        std::cout << "Example: " << argv[0] << " ../datasets/seq_1/360-VIO_format/images ../config/default_config.yaml" << std::endl;
+        LOG_INFO("Usage: {} <dataset_directory> [config_file]", argv[0]);
         return -1;
     }
     
-    std::string images_dir = argv[1];
+    std::string dataset_dir = argv[1];
     std::string config_file = (argc > 2) ? argv[2] : "../config/default_config.yaml";
+    
+    if (dataset_dir.back() != '/') dataset_dir += '/';
     
     // Load configuration
     auto& config = vio_360::ConfigUtils::GetInstance();
-    if (!config.Load(config_file)) {
-        std::cout << "Warning: Using default configuration values" << std::endl;
-    }
+    config.Load(config_file);
     
-    // Get image files
-    std::vector<std::string> image_files = GetImageFiles(images_dir);
-    if (image_files.empty()) {
-        std::cerr << "Error: No images found in " << images_dir << std::endl;
+    // Load data
+    auto cam_timestamps = LoadCameraTimestamps(dataset_dir + "cam_timestamps.txt");
+    auto all_imu_data = LoadIMUData(dataset_dir + "imu_data.csv");
+    auto image_files = GetImageFiles(dataset_dir + "images/");
+    
+    if (cam_timestamps.empty() || all_imu_data.empty() || image_files.empty()) {
+        LOG_ERROR("Failed to load dataset");
         return -1;
     }
     
-    std::cout << "Found " << image_files.size() << " images" << std::endl;
+    // Adjust sizes if needed
+    size_t min_count = std::min(image_files.size(), cam_timestamps.size());
+    image_files.resize(min_count);
+    cam_timestamps.resize(min_count);
     
-    // Read first image to get dimensions
+    // Calculate IMU frequency
+    double imu_duration = all_imu_data.back().timestamp - all_imu_data.front().timestamp;
+    double imu_freq = all_imu_data.size() / imu_duration;
+    
+    LOG_INFO("Dataset: {} images, {} IMU ({:.0f}Hz), {:.1f}s duration",
+             image_files.size(), all_imu_data.size(), imu_freq,
+             cam_timestamps.back() - cam_timestamps.front());
+    
+    // Read first image
     cv::Mat first_image = cv::imread(image_files[0], cv::IMREAD_GRAYSCALE);
     if (first_image.empty()) {
-        std::cerr << "Error: Failed to read first image" << std::endl;
+        LOG_ERROR("Failed to read first image");
         return -1;
     }
     
-    std::cout << "Original image size: " << first_image.cols << "x" << first_image.rows << std::endl;
-    std::cout << "Tracking image size: " << config.camera_width << "x" << config.camera_height << std::endl;
-    
-    // Create estimator
+    // Create estimator and visualizer
     auto estimator = std::make_unique<vio_360::Estimator>();
-    std::cout << "Initialized VIO estimator" << std::endl;
-    
-    // Create visualizer
     auto viz = std::make_unique<vio_360::VizUtils>(1920, 1080);
     viz->Initialize();
-    std::cout << "Initialized visualizer" << std::endl;
     
-    // Process frames
-    double timestamp = 0.0;  // seconds
-    const double dt = 1.0 / 30.0;  // 30 fps
+    LOG_INFO("Starting VIO...");
     
     std::shared_ptr<vio_360::Frame> prev_frame = nullptr;
+    double prev_timestamp = 0.0;
     
     for (size_t i = 0; i < image_files.size(); ++i) {
-        // Check if should close
-        if (viz->ShouldClose()) {
-            break;
-        }
+        if (viz->ShouldClose()) break;
         
-        // Check if paused - skip processing but keep updating viewer
+        // Handle pause and step
         if (viz->IsPaused()) {
-            viz->Update(estimator.get(), estimator->GetCurrentFrame(), prev_frame);
-            std::this_thread::sleep_for(std::chrono::milliseconds(30));
-            continue;
+            if (!viz->StepRequested()) {
+                viz->Update(estimator.get(), estimator->GetCurrentFrame(), prev_frame);
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                --i;  // Stay on current frame
+                continue;
+            }
+            // Step requested - proceed with this frame
         }
         
-        auto frame_start = std::chrono::high_resolution_clock::now();
+        double current_timestamp = cam_timestamps[i];
         
-        // Read image
+        std::vector<vio_360::IMUData> frame_imu_data;
+        if (i > 0) {
+            frame_imu_data = GetIMUBetweenTimestamps(all_imu_data, prev_timestamp, current_timestamp);
+        }
+        
         cv::Mat image = cv::imread(image_files[i], cv::IMREAD_GRAYSCALE);
-        if (image.empty()) {
-            std::cerr << "Warning: Failed to read " << image_files[i] << std::endl;
-            continue;
-        }
+        if (image.empty()) continue;
         
-        // Resize if needed
         if (image.cols != config.camera_width || image.rows != config.camera_height) {
             cv::resize(image, image, cv::Size(config.camera_width, config.camera_height), 0, 0, cv::INTER_AREA);
         }
         
-        // Process frame
-        auto result = estimator->ProcessFrame(image, timestamp);
-        
-        auto frame_end = std::chrono::high_resolution_clock::now();
-        double total_time = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
-        
-        // Get current frame
-        auto current_frame = estimator->GetCurrentFrame();
-        
-        // Update visualizer (viewer will draw tracking internally)
-        viz->Update(estimator.get(), current_frame, prev_frame);
-        
-        // If initialization succeeded, pause automatically
-        if (result.init_success) {
-            viz->SetPaused(true);
-            std::cout << "\n========================================" << std::endl;
-            std::cout << "[MAIN] Auto-paused: Initialization complete!" << std::endl;
-            std::cout << "       Press 'Pause' button to continue." << std::endl;
-            std::cout << "========================================\n" << std::endl;
+        vio_360::Estimator::EstimationResult result;
+        if (i > 0 && !frame_imu_data.empty()) {
+            result = estimator->ProcessFrame(image, current_timestamp, frame_imu_data);
+        } else {
+            result = estimator->ProcessFrame(image, current_timestamp);
         }
         
-        // Print progress
-        if ((i + 1) % 10 == 0) {
-            std::cout << "Frame " << std::setw(4) << (i + 1) 
-                     << " | Features: " << std::setw(4) << result.num_features
-                     << " | Tracked: " << std::setw(4) << result.num_tracked
-                     << " | Init: " << (estimator->IsInitialized() ? "YES" : "NO ")
-                     << " | " << std::fixed << std::setprecision(1) 
-                     << (1000.0 / total_time) << " fps" << std::endl;
+        auto current_frame = estimator->GetCurrentFrame();
+        viz->Update(estimator.get(), current_frame, prev_frame);
+        
+        if (result.init_success) {
+            viz->SetPaused(true);
+            LOG_INFO("Initialization complete! Press 'Pause' to continue.");
         }
         
         prev_frame = current_frame;
-        timestamp += dt;
+        prev_timestamp = current_timestamp;
     }
     
-    std::cout << "\n" << std::string(60, '=') << std::endl;
-    std::cout << "Processing Complete" << std::endl;
-    std::cout << std::string(60, '=') << std::endl;
-    std::cout << "Total frames: " << estimator->GetAllFrames().size() << std::endl;
-    std::cout << "Initialized: " << (estimator->IsInitialized() ? "YES" : "NO") << std::endl;
+    LOG_INFO("Processing complete: {} frames, initialized={}",
+             estimator->GetAllFrames().size(),
+             estimator->IsInitialized() ? "yes" : "no");
+    
+    viz->SetPaused(true);
+    while (!viz->ShouldClose()) {
+        viz->Update(estimator.get(), estimator->GetCurrentFrame(), prev_frame);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
     
     return 0;
 }

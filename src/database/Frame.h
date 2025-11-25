@@ -1,7 +1,8 @@
 /**
  * @file      Frame.h
  * @brief     Frame class for 360-degree VIO
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -19,21 +20,10 @@
 
 namespace vio_360 {
 
-// Forward declaration
+// Forward declarations
 class Feature;
-
-/**
- * @brief IMU measurement structure
- */
-struct IMUData {
-    double timestamp;              // timestamp in seconds
-    Eigen::Vector3f linear_accel;  // linear acceleration [m/s^2]
-    Eigen::Vector3f angular_vel;   // angular velocity [rad/s]
-    
-    IMUData() = default;
-    IMUData(double ts, const Eigen::Vector3f& accel, const Eigen::Vector3f& gyro)
-        : timestamp(ts), linear_accel(accel), angular_vel(gyro) {}
-};
+class MapPoint;
+struct IMUPreintegration;  // IMU preintegration data
 
 /**
  * @brief Frame class representing a single 360-degree image capture
@@ -114,16 +104,91 @@ public:
     double GetDtFromLastKeyframe() const { return m_dt_from_last_keyframe; }
     void SetDtFromLastKeyframe(double dt) { m_dt_from_last_keyframe = dt; }
     
-    // ============ IMU Data Management ============
+    // ============ IMU Preintegration ============
     
-    const std::vector<IMUData>& GetIMUDataFromLastFrame() const { return m_imu_data_from_last_frame; }
-    void SetIMUDataFromLastFrame(const std::vector<IMUData>& imu_data) { m_imu_data_from_last_frame = imu_data; }
-    bool HasIMUData() const { return !m_imu_data_from_last_frame.empty(); }
+    /**
+     * @brief Set preintegration from last keyframe
+     */
+    void SetIMUPreintegrationFromLastKeyframe(std::shared_ptr<IMUPreintegration> preint) {
+        m_imu_preint_from_last_kf = preint;
+    }
+    
+    /**
+     * @brief Get preintegration from last keyframe
+     */
+    std::shared_ptr<IMUPreintegration> GetIMUPreintegrationFromLastKeyframe() const {
+        return m_imu_preint_from_last_kf;
+    }
+    
+    /**
+     * @brief Check if has preintegration from last keyframe
+     */
+    bool HasIMUPreintegrationFromLastKeyframe() const {
+        return m_imu_preint_from_last_kf != nullptr;
+    }
+    
+    /**
+     * @brief Set preintegration from last frame
+     */
+    void SetIMUPreintegrationFromLastFrame(std::shared_ptr<IMUPreintegration> preint) {
+        m_imu_preint_from_last_frame = preint;
+    }
+    
+    /**
+     * @brief Get preintegration from last frame
+     */
+    std::shared_ptr<IMUPreintegration> GetIMUPreintegrationFromLastFrame() const {
+        return m_imu_preint_from_last_frame;
+    }
+    
+    /**
+     * @brief Check if has preintegration from last frame
+     */
+    bool HasIMUPreintegrationFromLastFrame() const {
+        return m_imu_preint_from_last_frame != nullptr;
+    }
     
     // ============ Feature Management ============
     
     void AddFeature(std::shared_ptr<Feature> feature) { m_features.push_back(feature); }
     void ClearFeatures() { m_features.clear(); }
+    
+    // ============ MapPoint Management ============
+    
+    /**
+     * @brief Initialize map_points vector with current feature count
+     */
+    void InitializeMapPoints();
+    
+    /**
+     * @brief Set map point for a feature
+     * @param feature_index Index in features vector
+     * @param map_point Map point to associate
+     */
+    void SetMapPoint(int feature_index, std::shared_ptr<MapPoint> map_point);
+    
+    /**
+     * @brief Get map point for a feature
+     * @param feature_index Index in features vector
+     * @return Map point or nullptr
+     */
+    std::shared_ptr<MapPoint> GetMapPoint(int feature_index) const;
+    
+    /**
+     * @brief Check if feature has an associated map point
+     */
+    bool HasMapPoint(int feature_index) const;
+    
+    /**
+     * @brief Get all map points
+     */
+    const std::vector<std::shared_ptr<MapPoint>>& GetMapPoints() const { return m_map_points; }
+    std::vector<std::shared_ptr<MapPoint>>& GetMapPointsMutable() { return m_map_points; }
+    
+    /**
+     * @brief Count valid (non-null) map points
+     */
+    int CountValidMapPoints() const;
     
     // ============ Grid-based Feature Management ============
     
@@ -188,6 +253,9 @@ private:
     // Features
     std::vector<std::shared_ptr<Feature>> m_features;
     
+    // Map points (same indexing as features)
+    std::vector<std::shared_ptr<MapPoint>> m_map_points;
+    
     // Pose (body frame in world frame)
     Eigen::Matrix3f m_rotation;    // Rotation matrix R_wb
     Eigen::Vector3f m_translation; // Translation vector t_wb
@@ -202,9 +270,6 @@ private:
     bool m_is_keyframe;
     double m_dt_from_last_keyframe; // Time since last keyframe [seconds]
     
-    // IMU data
-    std::vector<IMUData> m_imu_data_from_last_frame;
-    
     // Camera extrinsics (body to camera transformation)
     Eigen::Matrix4f m_T_BC;        // Camera to body
     Eigen::Matrix4f m_T_CB;        // Body to camera
@@ -216,6 +281,10 @@ private:
     
     // Grid structure: [row][col] = vector of feature indices
     std::vector<std::vector<std::vector<int>>> m_feature_grid;
+    
+    // IMU preintegration data
+    std::shared_ptr<IMUPreintegration> m_imu_preint_from_last_kf;    // From last keyframe
+    std::shared_ptr<IMUPreintegration> m_imu_preint_from_last_frame; // From last frame
 };
 
 } // namespace vio_360

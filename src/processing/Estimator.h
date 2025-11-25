@@ -1,7 +1,8 @@
 /**
  * @file      Estimator.h
  * @brief     Main VIO estimator for 360 ERP images
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -23,6 +24,16 @@ class Frame;
 class Camera;
 class FeatureTracker;
 class Initializer;
+class IMUPreintegrator;
+
+/**
+ * @brief IMU measurement data structure
+ */
+struct IMUData {
+    double timestamp;    // seconds
+    float ax, ay, az;    // m/s^2
+    float gx, gy, gz;    // rad/s
+};
 
 /**
  * @brief Main VIO estimator class
@@ -68,6 +79,16 @@ public:
      * @return Estimation result
      */
     EstimationResult ProcessFrame(const cv::Mat& image, double timestamp);
+    
+    /**
+     * @brief Process a new monocular frame with IMU data (VIO mode)
+     * @param image Input ERP image
+     * @param timestamp Frame timestamp in seconds
+     * @param imu_data IMU measurements between previous and current frame
+     * @return Estimation result
+     */
+    EstimationResult ProcessFrame(const cv::Mat& image, double timestamp, 
+                                  const std::vector<IMUData>& imu_data);
 
     /**
      * @brief Try to initialize monocular VO
@@ -115,11 +136,24 @@ public:
      * @return Vector of 4x4 transformation matrices [T_w1, T_w2]
      */
     const std::vector<Eigen::Matrix4f>& GetInitializationPoses() const { return m_init_poses; }
+    
+    /**
+     * @brief Get frame window (keyframes used in initialization)
+     * @return Vector of frames in the current window
+     */
+    const std::vector<std::shared_ptr<Frame>>& GetFrameWindow() const { return m_frame_window; }
+    
+    /**
+     * @brief Get all keyframes
+     * @return Vector of all keyframes
+     */
+    const std::vector<std::shared_ptr<Frame>>& GetKeyframes() const { return m_keyframes; }
 
 private:
     // System components
     std::unique_ptr<FeatureTracker> m_feature_tracker;
     std::unique_ptr<Initializer> m_initializer;
+    std::unique_ptr<IMUPreintegrator> m_imu_preintegrator;
     std::shared_ptr<Camera> m_camera;
     
     // State
@@ -177,6 +211,63 @@ private:
      * @brief Create a new keyframe from current frame
      */
     void CreateKeyframe();
+    
+    /**
+     * @brief Process IMU data and compute preintegration
+     * @param imu_data IMU measurements between frames
+     */
+    void ProcessIMU(const std::vector<IMUData>& imu_data);
+    
+    /**
+     * @brief Link MapPoints from previous frame to current frame based on feature tracking
+     */
+    void LinkMapPointsFromPreviousFrame();
+    
+    /**
+     * @brief Process intermediate frames after initialization
+     * Interpolate poses, link MapPoints, run PnP for frames between keyframes
+     */
+    void ProcessIntermediateFrames();
+    
+    /**
+     * @brief Compute median parallax between two frames
+     * @param frame1 First frame
+     * @param frame2 Second frame
+     * @return Median parallax in pixels
+     */
+    float ComputeParallax(const std::shared_ptr<Frame>& frame1,
+                          const std::shared_ptr<Frame>& frame2) const;
+    
+    /**
+     * @brief Triangulate a single 3D point from two bearing vectors
+     * @param bearing1 Bearing vector in frame1
+     * @param bearing2 Bearing vector in frame2
+     * @param T1w Transform from world to frame1
+     * @param T2w Transform from world to frame2
+     * @param point3d Output 3D point in world frame
+     * @return True if triangulation succeeded
+     */
+    bool TriangulateSinglePoint(
+        const Eigen::Vector3f& bearing1,
+        const Eigen::Vector3f& bearing2,
+        const Eigen::Matrix4f& T1w,
+        const Eigen::Matrix4f& T2w,
+        Eigen::Vector3f& point3d) const;
+    
+    /**
+     * @brief Triangulate new MapPoints between two keyframes
+     * @param kf1 First keyframe (reference)
+     * @param kf2 Second keyframe (current)
+     * @return Number of successfully triangulated MapPoints
+     */
+    int TriangulateNewMapPoints(
+        const std::shared_ptr<Frame>& kf1,
+        const std::shared_ptr<Frame>& kf2);
+    
+    /**
+     * @brief Accumulate IMU data since last keyframe
+     */
+    std::vector<IMUData> m_imu_since_last_keyframe;
 };
 
 } // namespace vio_360

@@ -28,6 +28,7 @@ ransac:
 
 tracking:
   min_features_ratio: 0.5
+  min_parallax_for_keyframe: 10.0  # Minimum parallax (pixels) to create new keyframe
 
 initialization:
   window_size: 10
@@ -51,10 +52,6 @@ visualization:
   highlight_clustered_grid: 1
   clustered_grid_color: [255, 100, 100]
   clustered_std_ratio: 0.25
-
-video_output:
-  fps: 30.0
-  codec: "mp4v"
 
 extrinsics:
   T_BC: 

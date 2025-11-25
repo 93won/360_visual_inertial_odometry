@@ -1,7 +1,8 @@
 /**
  * @file      Feature.h
  * @brief     Defines the Feature class, representing a 2D feature in an ERP image.
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *

@@ -1,7 +1,8 @@
 /**
  * @file      Frame.cpp
  * @brief     Implementation of Frame class for 360-degree VIO
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -11,6 +12,7 @@
 
 #include "Frame.h"
 #include "Feature.h"
+#include "MapPoint.h"
 
 namespace vio_360 {
 
@@ -209,6 +211,49 @@ std::vector<int> Frame::SelectFeaturesForTracking() const {
     }
     
     return selected_indices;
+}
+
+// ============ MapPoint Management ============
+
+void Frame::InitializeMapPoints() {
+    m_map_points.clear();
+    m_map_points.resize(m_features.size(), nullptr);
+}
+
+void Frame::SetMapPoint(int feature_index, std::shared_ptr<MapPoint> map_point) {
+    if (feature_index < 0 || feature_index >= static_cast<int>(m_map_points.size())) {
+        // Resize if needed
+        if (feature_index >= 0 && feature_index < static_cast<int>(m_features.size())) {
+            m_map_points.resize(m_features.size(), nullptr);
+        } else {
+            return;
+        }
+    }
+    m_map_points[feature_index] = map_point;
+}
+
+std::shared_ptr<MapPoint> Frame::GetMapPoint(int feature_index) const {
+    if (feature_index < 0 || feature_index >= static_cast<int>(m_map_points.size())) {
+        return nullptr;
+    }
+    return m_map_points[feature_index];
+}
+
+bool Frame::HasMapPoint(int feature_index) const {
+    if (feature_index < 0 || feature_index >= static_cast<int>(m_map_points.size())) {
+        return false;
+    }
+    return m_map_points[feature_index] != nullptr;
+}
+
+int Frame::CountValidMapPoints() const {
+    int count = 0;
+    for (const auto& mp : m_map_points) {
+        if (mp && !mp->IsBad()) {
+            count++;
+        }
+    }
+    return count;
 }
 
 } // namespace vio_360

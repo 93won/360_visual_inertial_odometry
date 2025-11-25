@@ -1,7 +1,8 @@
 /**
  * @file      Initializer.h
  * @brief     Handles monocular and visual-inertial initialization
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -16,6 +17,7 @@
 #include <Eigen/Dense>
 #include "../database/Frame.h"
 #include "../database/Feature.h"
+#include "../database/MapPoint.h"
 
 namespace vio_360 {
 
@@ -25,18 +27,24 @@ namespace vio_360 {
 struct InitializationResult {
     bool success;
     Eigen::Matrix3f R;                    // Rotation from frame1 to frame2
-    Eigen::Vector3f t;                    // Translation from frame1 to frame2 (unit vector)
-    std::vector<Eigen::Vector3f> points3d; // 3D points in frame1 coordinates
-    std::vector<int> track_ids;           // Corresponding track IDs
+    Eigen::Vector3f t;                    // Translation from frame1 to frame2 (scaled)
+    std::vector<Eigen::Vector3f> points3d; // 3D points in world coordinates (scaled)
+    std::vector<int> track_ids;           // Corresponding track IDs (feature IDs)
     int frame1_id;                        // First frame ID
     int frame2_id;                        // Second frame ID
+    
+    // Initialized keyframes and map points (like lightweight_vio)
+    std::vector<std::shared_ptr<Frame>> initialized_keyframes;
+    std::vector<std::shared_ptr<MapPoint>> initialized_mappoints;
+    float scale_factor;                   // Scale factor used (1/median_depth)
     
     InitializationResult() 
         : success(false)
         , R(Eigen::Matrix3f::Identity())
         , t(Eigen::Vector3f::Zero())
         , frame1_id(-1)
-        , frame2_id(-1) {}
+        , frame2_id(-1)
+        , scale_factor(1.0f) {}
 };
 
 /**
@@ -82,6 +90,16 @@ public:
     std::vector<std::shared_ptr<Feature>> SelectFeaturesForInit(
         const std::vector<std::shared_ptr<Frame>>& frames
     ) const;
+    
+    /**
+     * @brief Interpolate poses for intermediate frames and register MapPoint observations
+     * @param frames All frames in window (first and last should have poses set)
+     * @param mappoints MapPoints created during initialization
+     */
+    void InterpolateIntermediateFrames(
+        const std::vector<std::shared_ptr<Frame>>& frames,
+        const std::vector<std::shared_ptr<MapPoint>>& mappoints
+    );
     
     // ============ Status & Results ============
     
@@ -224,6 +242,7 @@ private:
      * @param R Rotation matrix
      * @param t Translation vector
      * @param inlier_mask Inlier mask
+     * @param mean_error Output: mean reprojection error in pixels
      * @return True if validation passes
      */
     bool ValidateInitialization(
@@ -232,8 +251,43 @@ private:
         const std::vector<Eigen::Vector3f>& points3d,
         const Eigen::Matrix3f& R,
         const Eigen::Vector3f& t,
-        const std::vector<bool>& inlier_mask
+        const std::vector<bool>& inlier_mask,
+        float& mean_error
     ) const;
+    
+    /**
+     * @brief Normalize scale so that median depth = 1.0
+     * @param points3d 3D points to scale (modified in place)
+     * @param t Translation vector to scale (modified in place)
+     * @return Scale factor used (1/median_depth)
+     */
+    float NormalizeScale(
+        std::vector<Eigen::Vector3f>& points3d,
+        Eigen::Vector3f& t
+    ) const;
+    
+    /**
+     * @brief Create MapPoints and register to frames
+     * @param frame1 First keyframe
+     * @param frame2 Second keyframe
+     * @param points3d Triangulated 3D points in world frame
+     * @param selected_features Features used for triangulation
+     * @param result Output: populated with mappoints
+     */
+    void CreateMapPoints(
+        std::shared_ptr<Frame> frame1,
+        std::shared_ptr<Frame> frame2,
+        const std::vector<Eigen::Vector3f>& points3d,
+        const std::vector<std::shared_ptr<Feature>>& selected_features,
+        InitializationResult& result
+    );
+    
+    /**
+     * @brief Compute mean reprojection error for a frame using equirectangular projection
+     * @param frame Frame to compute error for
+     * @return Mean reprojection error in pixels
+     */
+    double ComputeFrameReprojectionError(const std::shared_ptr<Frame>& frame) const;
 
 private:
     // ============ State ============

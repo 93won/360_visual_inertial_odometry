@@ -1,7 +1,8 @@
 /**
  * @file      VizUtils.h
  * @brief     Visualization utilities for 360 VIO
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *
@@ -72,6 +73,15 @@ public:
     void SetPaused(bool paused) { m_paused = paused; }
     
     /**
+     * @brief Check if step was requested
+     */
+    bool StepRequested() { 
+        bool result = m_step_requested; 
+        m_step_requested = false; 
+        return result; 
+    }
+    
+    /**
      * @brief Get color from age
      */
     static cv::Scalar GetColorFromAge(int age, int max_age = 10);
@@ -105,9 +115,11 @@ private:
     std::unique_ptr<pangolin::Var<bool>> m_follow_camera;
     std::unique_ptr<pangolin::Var<int>> m_point_size;
     std::unique_ptr<pangolin::Var<bool>> m_pause_button;
+    std::unique_ptr<pangolin::Var<bool>> m_step_button;
     
     // Pause state
     bool m_paused;
+    bool m_step_requested;
     
     // Mutex for thread safety
     std::mutex m_mutex;
@@ -128,9 +140,10 @@ private:
     void DrawKeyframes(const std::vector<std::shared_ptr<Frame>>& keyframes);
     
     /**
-     * @brief Draw camera frustum
+     * @brief Draw camera as wireframe sphere with body frame axes
+     * @param T_wb Body (IMU) to world transformation
      */
-    void DrawCamera(const Eigen::Matrix4f& T_wc, float r, float g, float b, float size = 0.1f);
+    void DrawCamera(const Eigen::Matrix4f& T_wb, float r, float g, float b, float size = 0.1f);
     
     /**
      * @brief Draw coordinate axis

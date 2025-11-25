@@ -1,7 +1,8 @@
 /**
  * @file      FeatureTracker.h
  * @brief     Feature tracking on Equirectangular (360-degree) images.
- * @author    Seungwon Choi (csw3575@snu.ac.kr)
+ * @author    Seungwon Choi
+ * @email     csw3575@snu.ac.kr
  * @date      2025-11-25
  * @copyright Copyright (c) 2025 Seungwon Choi. All rights reserved.
  *

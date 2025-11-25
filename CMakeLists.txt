@@ -13,19 +13,43 @@ endif()
 # Release mode optimization flags
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native")
 
+# Set OpenGL preference
+set(OpenGL_GL_PREFERENCE GLVND)
+
 # Find required packages
 find_package(OpenCV 4 REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(Pangolin REQUIRED)
+find_package(OpenGL REQUIRED)
+find_package(GLEW REQUIRED)
 
-# Include directories
+# Add thirdparty libraries
+set(BUILD_PANGOLIN_EXAMPLES OFF CACHE BOOL "Build Pangolin examples" FORCE)
+set(BUILD_PANGOLIN_TESTS OFF CACHE BOOL "Build Pangolin tests" FORCE)
+set(BUILD_PANGOLIN_TOOLS OFF CACHE BOOL "Build Pangolin tools" FORCE)
+set(BUILD_PANGOLIN_PYTHON OFF CACHE BOOL "Build Pangolin Python bindings" FORCE)
+add_subdirectory(thirdparty/pangolin EXCLUDE_FROM_ALL)
+
+set(BUILD_EXAMPLES OFF CACHE BOOL "Build Ceres examples" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "Build Ceres benchmarks" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "Build Ceres tests" FORCE)
+set(PROVIDE_UNINSTALL_TARGET OFF CACHE BOOL "Disable Ceres uninstall target" FORCE)
+add_subdirectory(thirdparty/ceres-solver EXCLUDE_FROM_ALL)
+
+# spdlog (header-only)
+add_subdirectory(thirdparty/spdlog EXCLUDE_FROM_ALL)
+
+# Include directories - thirdparty Pangolin ONLY (not system)
 include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/include
+    ${CMAKE_CURRENT_BINARY_DIR}/thirdparty/pangolin/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ceres-solver/include
+    ${CMAKE_CURRENT_BINARY_DIR}/thirdparty/ceres-solver/config
     ${OpenCV_INCLUDE_DIRS}
     ${EIGEN3_INCLUDE_DIR}
-    ${Pangolin_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/database
     ${CMAKE_CURRENT_SOURCE_DIR}/src/processing
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/optimization
     ${CMAKE_CURRENT_SOURCE_DIR}/src/util
 )
 
@@ -34,9 +58,14 @@ set(SOURCES
     src/database/Camera.cpp
     src/database/Feature.cpp
     src/database/Frame.cpp
+    src/database/MapPoint.cpp
     src/processing/FeatureTracker.cpp
     src/processing/Estimator.cpp
     src/processing/Initializer.cpp
+    src/processing/IMUPreintegrator.cpp
+    src/optimization/Factors.cpp
+    src/optimization/Parameters.cpp
+    src/optimization/Optimizer.cpp
     src/util/LieUtils.cpp
     src/util/ConfigUtils.cpp
     src/util/VizUtils.cpp
@@ -46,7 +75,15 @@ set(SOURCES
 add_library(vio_360_lib ${SOURCES})
 target_link_libraries(vio_360_lib
     ${OpenCV_LIBS}
-    ${Pangolin_LIBRARIES}
+    ${OPENGL_LIBRARIES}
+    ${GLEW_LIBRARIES}
+    pango_display
+    pango_opengl
+    pango_windowing
+    pango_vars
+    pango_core
+    ceres
+    spdlog::spdlog_header_only
 )
 
 # Main application
@@ -57,7 +94,15 @@ add_executable(feature_tracking_demo
 target_link_libraries(feature_tracking_demo
     vio_360_lib
     ${OpenCV_LIBS}
-    ${Pangolin_LIBRARIES}
+    ${OPENGL_LIBRARIES}
+    ${GLEW_LIBRARIES}
+    pango_display
+    pango_opengl
+    pango_windowing
+    pango_vars
+    pango_core
+    ceres
+    spdlog::spdlog_header_only
 )
 
 # Set output directory
@@ -69,4 +114,3 @@ set_target_properties(feature_tracking_demo PROPERTIES
 message(STATUS "OpenCV version: ${OpenCV_VERSION}")
 message(STATUS "OpenCV libs: ${OpenCV_LIBS}")
 message(STATUS "Eigen3 include: ${EIGEN3_INCLUDE_DIR}")
-message(STATUS "Pangolin include: ${Pangolin_INCLUDE_DIRS}")
