@@ -19,7 +19,8 @@ namespace vio_360 {
 
 VizUtils::VizUtils(int window_width, int window_height)
     : m_window_width(window_width)
-    , m_window_height(window_height) {
+    , m_window_height(window_height)
+    , m_paused(false) {
 }
 
 VizUtils::~VizUtils() {
@@ -71,8 +72,10 @@ void VizUtils::Initialize() {
     m_show_trajectory = std::make_unique<pangolin::Var<bool>>("ui.Show Trajectory", true, true);
     m_show_keyframes = std::make_unique<pangolin::Var<bool>>("ui.Show Keyframes", true, true);
     m_show_map_points = std::make_unique<pangolin::Var<bool>>("ui.Show Map Points", false, true);
+    m_show_init_result = std::make_unique<pangolin::Var<bool>>("ui.Show Init Result", true, true);
     m_follow_camera = std::make_unique<pangolin::Var<bool>>("ui.Follow Camera", true, true);
     m_point_size = std::make_unique<pangolin::Var<int>>("ui.Point Size", 2, 1, 10);
+    m_pause_button = std::make_unique<pangolin::Var<bool>>("ui.Pause", false, false);
     
     std::cout << "[VIZUTILS] Initialized" << std::endl;
 }
@@ -81,6 +84,12 @@ void VizUtils::Update(const Estimator* estimator,
                       std::shared_ptr<Frame> current_frame,
                       std::shared_ptr<Frame> previous_frame) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    
+    // Check pause button
+    if (pangolin::Pushed(*m_pause_button)) {
+        m_paused = !m_paused;
+        std::cout << "[VIZUTILS] " << (m_paused ? "Paused" : "Resumed") << std::endl;
+    }
     
     // Clear screen with black background
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -146,6 +155,31 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
     
     // Draw coordinate axis
     DrawAxis(1.0f);
+    
+    // Draw initialization result if available
+    if (*m_show_init_result && estimator->IsInitialized()) {
+        const auto& init_points = estimator->GetInitializedPoints();
+        const auto& init_poses = estimator->GetInitializationPoses();
+        
+        // Draw initialized 3D points
+        if (!init_points.empty()) {
+            glPointSize(static_cast<float>(*m_point_size) * 2.0f);
+            glBegin(GL_POINTS);
+            glColor3f(0.0f, 1.0f, 0.0f);  // Green for initialized points
+            
+            for (const auto& pt : init_points) {
+                glVertex3f(pt.x(), pt.y(), pt.z());
+            }
+            
+            glEnd();
+        }
+        
+        // Draw initialization camera poses
+        if (init_poses.size() >= 2) {
+            DrawCamera(init_poses[0], 1.0f, 1.0f, 0.0f, 0.15f);  // Yellow for frame 1
+            DrawCamera(init_poses[1], 1.0f, 0.5f, 0.0f, 0.15f);  // Orange for frame 2
+        }
+    }
     
     // Draw trajectory
     if (*m_show_trajectory) {

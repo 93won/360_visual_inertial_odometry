@@ -32,6 +32,14 @@ tracking:
 initialization:
   window_size: 10
   min_parallax: 10.0
+  min_features: 50
+  min_observations: 10
+  grid_cols: 20
+  grid_rows: 10
+  ransac_threshold: 0.01  # 0.01 radians ≈ 0.57 degrees
+  ransac_iterations: 200
+  min_inlier_ratio: 0.7
+  max_reprojection_error: 5.0  # Maximum reprojection error in pixels
 
 visualization:
   scale: 1.0

@@ -21,6 +21,7 @@
 #include <string>
 #include <filesystem>
 #include <chrono>
+#include <thread>
 
 namespace fs = std::filesystem;
 
@@ -100,6 +101,13 @@ int main(int argc, char** argv) {
             break;
         }
         
+        // Check if paused - skip processing but keep updating viewer
+        if (viz->IsPaused()) {
+            viz->Update(estimator.get(), estimator->GetCurrentFrame(), prev_frame);
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            continue;
+        }
+        
         auto frame_start = std::chrono::high_resolution_clock::now();
         
         // Read image
@@ -125,6 +133,15 @@ int main(int argc, char** argv) {
         
         // Update visualizer (viewer will draw tracking internally)
         viz->Update(estimator.get(), current_frame, prev_frame);
+        
+        // If initialization succeeded, pause automatically
+        if (result.init_success) {
+            viz->SetPaused(true);
+            std::cout << "\n========================================" << std::endl;
+            std::cout << "[MAIN] Auto-paused: Initialization complete!" << std::endl;
+            std::cout << "       Press 'Pause' button to continue." << std::endl;
+            std::cout << "========================================\n" << std::endl;
+        }
         
         // Print progress
         if ((i + 1) % 10 == 0) {

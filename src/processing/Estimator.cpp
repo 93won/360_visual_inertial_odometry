@@ -84,11 +84,26 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
         
         // Try to initialize when window is full
         if (static_cast<int>(m_frame_window.size()) == m_window_size) {
-            bool init_success = TryInitialize();
-            if (init_success) {
-                std::cout << "[ESTIMATOR] Initialization successful!" << std::endl;
+            bool init_result = TryInitialize();
+            
+            if (init_result) {
+                // Initialization succeeded!
+                result.init_success = true;
                 m_initialized = true;
-                result.success = true;
+                std::cout << "[ESTIMATOR] System initialized successfully!" << std::endl;
+            } else {
+                // Check if ready for initialization (sufficient parallax)
+                if (m_frame_window.size() >= 2) {
+                    auto first_frame = m_frame_window.front();
+                    auto last_frame = m_frame_window.back();
+                    float parallax = m_initializer->ComputeParallax(first_frame, last_frame);
+                    
+                    if (parallax >= m_min_parallax) {
+                        result.init_ready = true;
+                        // Pause even on failure for debugging
+                        result.init_success = true;  // Trigger pause for debugging
+                    }
+                }
             }
         }
     } else {
@@ -136,29 +151,60 @@ bool Estimator::TryInitialize() {
     // Compute parallax between first and last frames
     float parallax = m_initializer->ComputeParallax(first_frame, last_frame);
     
-    std::cout << "[ESTIMATOR] Initialization attempt: window_size=" 
-              << m_frame_window.size() 
-              << ", parallax=" << parallax << " pixels"
-              << " (min required: " << m_min_parallax << ")" << std::endl;
-    
     // Check if parallax is sufficient
     if (parallax < m_min_parallax) {
-        std::cout << "[ESTIMATOR] Insufficient parallax for initialization" << std::endl;
+        // Insufficient parallax - silently continue
         return false;
     }
     
-    std::cout << "[ESTIMATOR] Sufficient parallax! Ready to initialize..." << std::endl;
-    std::cout << "[ESTIMATOR] (Full initialization not yet implemented - pausing here)" << std::endl;
+    // Sufficient parallax - print initialization attempt
+    std::cout << "\n" << std::string(60, '=') << std::endl;
+    std::cout << "[ESTIMATOR] Initialization attempt!" << std::endl;
+    std::cout << "  Window size: " << m_frame_window.size() << " frames" << std::endl;
+    std::cout << "  Parallax: " << parallax << " pixels (min: " << m_min_parallax << ")" << std::endl;
+    std::cout << "  Status: Ready to initialize!" << std::endl;
+    std::cout << std::string(60, '=') << "\n" << std::endl;
     
-    // TODO: Implement full monocular initialization
-    // 1. Select features with sufficient observations
-    // 2. Compute Essential matrix + RANSAC
-    // 3. Recover pose (R, t)
-    // 4. Triangulate initial map points
-    // 5. Check reprojection error
+    // Step 1: Select features with sufficient observations
+    auto selected_features = m_initializer->SelectFeaturesForInit(m_frame_window);
     
-    // For now, just return false (will implement full init later)
-    return false;
+    if (selected_features.empty()) {
+        std::cout << "[ESTIMATOR] Feature selection failed - cannot initialize" << std::endl;
+        return false;
+    }
+    
+    // Step 2: Try monocular initialization
+    InitializationResult init_result;
+    bool init_success = m_initializer->TryMonocularInitialization(m_frame_window, init_result);
+    
+    if (!init_success) {
+        std::cout << "[ESTIMATOR] Monocular initialization failed" << std::endl;
+        return false;
+    }
+    
+    std::cout << "[ESTIMATOR] Monocular initialization succeeded!" << std::endl;
+    
+    // Step 3: Store initialization results
+    m_initialized_points = init_result.points3d;
+    
+    // Create pose matrices (Frame 1 at origin, Frame 2 with [R|t])
+    m_init_poses.clear();
+    m_init_poses.resize(2);
+    
+    // T_w1 = Identity (Frame 1 is at world origin)
+    m_init_poses[0] = Eigen::Matrix4f::Identity();
+    
+    // T_w2 = [R | t]
+    //        [0 | 1]
+    m_init_poses[1] = Eigen::Matrix4f::Identity();
+    m_init_poses[1].block<3, 3>(0, 0) = init_result.R;
+    m_init_poses[1].block<3, 1>(0, 3) = init_result.t;
+    
+    std::cout << "[ESTIMATOR] Stored " << m_initialized_points.size() 
+              << " 3D points and 2 camera poses" << std::endl;
+    
+    // Return true to signal initialization is ready
+    return true;
 }
 
 void Estimator::Reset() {

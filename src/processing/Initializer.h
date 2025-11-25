@@ -20,6 +20,26 @@
 namespace vio_360 {
 
 /**
+ * @brief Initialization result structure
+ */
+struct InitializationResult {
+    bool success;
+    Eigen::Matrix3f R;                    // Rotation from frame1 to frame2
+    Eigen::Vector3f t;                    // Translation from frame1 to frame2 (unit vector)
+    std::vector<Eigen::Vector3f> points3d; // 3D points in frame1 coordinates
+    std::vector<int> track_ids;           // Corresponding track IDs
+    int frame1_id;                        // First frame ID
+    int frame2_id;                        // Second frame ID
+    
+    InitializationResult() 
+        : success(false)
+        , R(Eigen::Matrix3f::Identity())
+        , t(Eigen::Vector3f::Zero())
+        , frame1_id(-1)
+        , frame2_id(-1) {}
+};
+
+/**
  * @brief Initializer class for monocular and visual-inertial initialization
  * 
  * Handles:
@@ -36,9 +56,12 @@ public:
     /**
      * @brief Attempt monocular initialization with current frames
      * @param frames Window of frames to use for initialization
+     * @param result Output initialization result
      * @return True if initialization successful
      */
-    bool TryMonocularInitialization(const std::vector<std::shared_ptr<Frame>>& frames);
+    bool TryMonocularInitialization(
+        const std::vector<std::shared_ptr<Frame>>& frames,
+        InitializationResult& result);
     
     /**
      * @brief Compute median parallax between two frames using tracked features
@@ -49,6 +72,15 @@ public:
     float ComputeParallax(
         const std::shared_ptr<Frame>& frame1,
         const std::shared_ptr<Frame>& frame2
+    ) const;
+    
+    /**
+     * @brief Select features with sufficient observations for initialization
+     * @param frames Frame window
+     * @return Selected features
+     */
+    std::vector<std::shared_ptr<Feature>> SelectFeaturesForInit(
+        const std::vector<std::shared_ptr<Frame>>& frames
     ) const;
     
     // ============ Status & Results ============
@@ -70,15 +102,6 @@ public:
 
 private:
     // ============ Monocular Initialization Helpers ============
-    
-    /**
-     * @brief Select features with sufficient observations for initialization
-     * @param frames Frame window
-     * @return Selected features
-     */
-    std::vector<std::shared_ptr<Feature>> SelectFeaturesForInit(
-        const std::vector<std::shared_ptr<Frame>>& frames
-    ) const;
     
     /**
      * @brief Select best frame pair based on parallax
@@ -143,12 +166,82 @@ private:
         const Eigen::Vector3f& t,
         std::vector<Eigen::Vector3f>& points3d
     ) const;
+    
+    /**
+     * @brief Triangulate a single 3D point using mid-point method
+     * @param bearing1 Bearing vector from frame1
+     * @param bearing2 Bearing vector from frame2
+     * @param R Rotation from frame1 to frame2
+     * @param t Translation from frame1 to frame2
+     * @param point3d Output 3D point
+     * @return True if triangulation successful
+     */
+    bool TriangulateSinglePoint(
+        const Eigen::Vector3f& bearing1,
+        const Eigen::Vector3f& bearing2,
+        const Eigen::Matrix3f& R,
+        const Eigen::Vector3f& t,
+        Eigen::Vector3f& point3d
+    ) const;
+    
+    /**
+     * @brief Test a pose candidate using cheirality check
+     * @param R Rotation candidate
+     * @param t Translation candidate
+     * @param bearings1 Bearing vectors from frame1
+     * @param bearings2 Bearing vectors from frame2
+     * @param inlier_mask Inlier mask from RANSAC
+     * @return Number of points passing cheirality check
+     */
+    int TestPoseCandidate(
+        const Eigen::Matrix3f& R,
+        const Eigen::Vector3f& t,
+        const std::vector<Eigen::Vector3f>& bearings1,
+        const std::vector<Eigen::Vector3f>& bearings2,
+        const std::vector<bool>& inlier_mask
+    ) const;
+    
+    /**
+     * @brief Compute reprojection error for a 3D point
+     * @param point3d 3D point in frame1 coordinates
+     * @param bearing_observed Observed bearing vector in frame2
+     * @param R Rotation from frame1 to frame2
+     * @param t Translation from frame1 to frame2
+     * @return Angular error in radians
+     */
+    float ComputeReprojectionError(
+        const Eigen::Vector3f& point3d,
+        const Eigen::Vector3f& bearing_observed,
+        const Eigen::Matrix3f& R,
+        const Eigen::Vector3f& t
+    ) const;
+    
+    /**
+     * @brief Validate initialization quality
+     * @param bearings1 Bearing vectors from frame1
+     * @param bearings2 Bearing vectors from frame2
+     * @param points3d Triangulated 3D points
+     * @param R Rotation matrix
+     * @param t Translation vector
+     * @param inlier_mask Inlier mask
+     * @return True if validation passes
+     */
+    bool ValidateInitialization(
+        const std::vector<Eigen::Vector3f>& bearings1,
+        const std::vector<Eigen::Vector3f>& bearings2,
+        const std::vector<Eigen::Vector3f>& points3d,
+        const Eigen::Matrix3f& R,
+        const Eigen::Vector3f& t,
+        const std::vector<bool>& inlier_mask
+    ) const;
 
 private:
     // ============ State ============
     bool m_is_initialized;
     
-    // ============ Configuration ============
+    // ============ Configuration (cached from ConfigUtils) ============
+    int m_camera_width;              // Camera image width
+    int m_camera_height;             // Camera image height
     int m_min_features;              // Minimum features for initialization
     int m_min_observations;          // Minimum observations per feature
     float m_min_parallax;            // Minimum parallax in pixels
@@ -156,6 +249,8 @@ private:
     int m_ransac_iterations;         // RANSAC iterations
     float m_min_inlier_ratio;        // Minimum inlier ratio for success
     float m_max_reprojection_error;  // Maximum reprojection error
+    int m_init_grid_cols;            // Grid columns for feature sampling
+    int m_init_grid_rows;            // Grid rows for feature sampling
 };
 
 } // namespace vio_360

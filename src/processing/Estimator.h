@@ -38,13 +38,17 @@ public:
         int num_features;              // Total features in current frame
         int num_tracked;               // Successfully tracked features
         int num_inliers;               // Inliers after RANSAC
+        bool init_ready;               // Initialization is ready (sufficient parallax)
+        bool init_success;             // Initialization successfully completed
         
         EstimationResult() 
             : success(false)
             , pose(Eigen::Matrix4f::Identity())
             , num_features(0)
             , num_tracked(0)
-            , num_inliers(0) {}
+            , num_inliers(0)
+            , init_ready(false)
+            , init_success(false) {}
     };
 
     /**
@@ -99,6 +103,18 @@ public:
      * @return True if initialized
      */
     bool IsInitialized() const { return m_initialized; }
+    
+    /**
+     * @brief Get initialized 3D points (map points from initialization)
+     * @return Vector of 3D points in world coordinates
+     */
+    const std::vector<Eigen::Vector3f>& GetInitializedPoints() const { return m_initialized_points; }
+    
+    /**
+     * @brief Get initialization camera poses (frame1 and frame2)
+     * @return Vector of 4x4 transformation matrices [T_w1, T_w2]
+     */
+    const std::vector<Eigen::Matrix4f>& GetInitializationPoses() const { return m_init_poses; }
 
 private:
     // System components
@@ -123,6 +139,10 @@ private:
     // Initialization state
     bool m_initialized;
     float m_min_parallax;
+    
+    // Initialized map points and poses
+    std::vector<Eigen::Vector3f> m_initialized_points;  // 3D points from initialization
+    std::vector<Eigen::Matrix4f> m_init_poses;          // [T_w1, T_w2] poses from initialization
     
     // Current pose (T_wc: world to camera)
     Eigen::Matrix4f m_current_pose;

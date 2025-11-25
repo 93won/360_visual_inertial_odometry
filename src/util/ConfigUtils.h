@@ -62,6 +62,14 @@ public:
     // Initialization
     int initialization_window_size;
     float initialization_min_parallax;
+    int initialization_min_features;
+    int initialization_min_observations;
+    int initialization_grid_cols;
+    int initialization_grid_rows;
+    float initialization_ransac_threshold;
+    int initialization_ransac_iterations;
+    float initialization_min_inlier_ratio;
+    float initialization_max_reprojection_error;
     
     // Visualization
     float visualization_scale;

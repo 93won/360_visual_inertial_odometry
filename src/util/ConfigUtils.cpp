@@ -57,6 +57,14 @@ void ConfigUtils::SetDefaultValues() {
     // Initialization
     initialization_window_size = 20;
     initialization_min_parallax = 10.0f;
+    initialization_min_features = 50;
+    initialization_min_observations = 10;
+    initialization_grid_cols = 8;
+    initialization_grid_rows = 4;
+    initialization_ransac_threshold = 0.001f;
+    initialization_ransac_iterations = 200;
+    initialization_min_inlier_ratio = 0.7f;
+    initialization_max_reprojection_error = 2.0f;
     
     // Visualization
     visualization_scale = 1.0f;
@@ -143,6 +151,14 @@ bool ConfigUtils::Load(const std::string& config_file) {
     if (!initialization.empty()) {
         initialization_window_size = (int)initialization["window_size"];
         initialization_min_parallax = (float)(double)initialization["min_parallax"];
+        initialization_min_features = (int)initialization["min_features"];
+        initialization_min_observations = (int)initialization["min_observations"];
+        initialization_grid_cols = (int)initialization["grid_cols"];
+        initialization_grid_rows = (int)initialization["grid_rows"];
+        initialization_ransac_threshold = (float)(double)initialization["ransac_threshold"];
+        initialization_ransac_iterations = (int)initialization["ransac_iterations"];
+        initialization_min_inlier_ratio = (float)(double)initialization["min_inlier_ratio"];
+        initialization_max_reprojection_error = (float)(double)initialization["max_reprojection_error"];
     }
     
     // Visualization

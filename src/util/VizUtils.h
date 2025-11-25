@@ -62,6 +62,16 @@ public:
     bool ShouldClose();
     
     /**
+     * @brief Check if paused
+     */
+    bool IsPaused() const { return m_paused; }
+    
+    /**
+     * @brief Set pause state
+     */
+    void SetPaused(bool paused) { m_paused = paused; }
+    
+    /**
      * @brief Get color from age
      */
     static cv::Scalar GetColorFromAge(int age, int max_age = 10);
@@ -91,8 +101,13 @@ private:
     std::unique_ptr<pangolin::Var<bool>> m_show_trajectory;
     std::unique_ptr<pangolin::Var<bool>> m_show_keyframes;
     std::unique_ptr<pangolin::Var<bool>> m_show_map_points;
+    std::unique_ptr<pangolin::Var<bool>> m_show_init_result;
     std::unique_ptr<pangolin::Var<bool>> m_follow_camera;
     std::unique_ptr<pangolin::Var<int>> m_point_size;
+    std::unique_ptr<pangolin::Var<bool>> m_pause_button;
+    
+    // Pause state
+    bool m_paused;
     
     // Mutex for thread safety
     std::mutex m_mutex;
