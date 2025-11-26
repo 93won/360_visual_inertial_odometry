@@ -209,15 +209,19 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
     
     // Draw keyframes as spheres
     if (*m_show_keyframes && estimator->IsInitialized()) {
-        const auto& keyframes = estimator->GetKeyframes();
-        for (size_t i = 0; i < keyframes.size(); ++i) {
-            const auto& kf = keyframes[i];
+        const auto& all_keyframes = estimator->GetAllKeyframes();
+        for (size_t i = 0; i < all_keyframes.size(); ++i) {
+            const auto& kf = all_keyframes[i];
             
             Eigen::Matrix4f T_wb = kf->GetTwb();
             Eigen::Vector3f pos = T_wb.block<3, 1>(0, 3);
             
-            // All keyframes mint color
-            glColor3f(0.0f, 0.9f, 0.7f);  // Mint color for keyframes
+            // Check if keyframe is in current sliding window
+            if (estimator->IsKeyframeInWindow(kf->GetFrameId())) {
+                glColor3f(0.0f, 0.9f, 0.7f);  // Mint color for window keyframes
+            } else {
+                glColor3f(0.5f, 0.5f, 0.5f);  // Gray for out-of-window keyframes
+            }
             
             // Draw wireframe sphere
             glPushMatrix();

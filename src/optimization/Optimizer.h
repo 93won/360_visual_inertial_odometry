@@ -93,6 +93,21 @@ public:
                    bool fix_last_pose = false);
     
     /**
+     * @brief Run Local BA with sliding window
+     * 
+     * Optimizes poses of window frames and all MapPoints observed by them.
+     * MapPoints that are observed by frames outside the window will include
+     * those observations as constraints with FIXED poses.
+     * 
+     * @param window_frames Vector of frames in the sliding window
+     *        - First frame is always fixed (gauge freedom)
+     *        - Other window frames are optimized
+     *        - Frames outside window that observe the MapPoints are fixed
+     * @return BA optimization result
+     */
+    BAResult RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window_frames);
+    
+    /**
      * @brief Run Full BA on initialization window
      * @param frames Vector of frames (first and last have known poses from Essential)
      * @return BA optimization result

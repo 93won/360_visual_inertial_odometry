@@ -52,13 +52,17 @@ bool Initializer::TryMonocularInitialization(
     result = InitializationResult();
     
     if (frames.size() < 2) {
+        LOG_INFO("  [MonoInit] frames.size()={} < 2", frames.size());
         return false;
     }
     
     // 1. Select features with sufficient observations
     auto selected_features = SelectFeaturesForInit(frames);
     
+    LOG_INFO("  [MonoInit] Selected {} features (min={})", selected_features.size(), m_min_features);
+    
     if (selected_features.size() < static_cast<size_t>(m_min_features)) {
+        LOG_INFO("  [MonoInit] Not enough features");
         return false;
     }
     
@@ -108,7 +112,10 @@ bool Initializer::TryMonocularInitialization(
         bearings2.push_back(features2[feat_idx2]->GetBearing());
     }
     
+    LOG_INFO("  [MonoInit] Valid bearing pairs: {}", bearings1.size());
+    
     if (bearings1.size() < 5) {
+        LOG_INFO("  [MonoInit] Too few bearings (<5)");
         return false;
     }
     
@@ -117,30 +124,43 @@ bool Initializer::TryMonocularInitialization(
     std::vector<bool> inlier_mask;
     
     if (!ComputeEssentialMatrix(bearings1, bearings2, E, inlier_mask)) {
+        LOG_WARN("  [MonoInit] Essential matrix computation failed");
         return false;
     }
+    
+    int E_inliers = std::count(inlier_mask.begin(), inlier_mask.end(), true);
+    LOG_INFO("  [MonoInit] Essential matrix: {} inliers / {} total", E_inliers, inlier_mask.size());
     
     // 5. Recover pose (R, t) from Essential matrix
     Eigen::Matrix3f R;
     Eigen::Vector3f t;
     
     if (!RecoverPose(E, bearings1, bearings2, R, t, inlier_mask)) {
+        LOG_WARN("  [MonoInit] Pose recovery failed");
         return false;
     }
+    
+    LOG_INFO("  [MonoInit] Pose recovered: t=({:.4f},{:.4f},{:.4f})", t.x(), t.y(), t.z());
     
     // 6. Triangulate all inlier points
     std::vector<Eigen::Vector3f> points3d;
     int num_triangulated = TriangulatePoints(bearings1, bearings2, R, t, points3d);
     
+    LOG_INFO("  [MonoInit] Triangulated {} points (min={})", num_triangulated, m_min_features);
+    
     if (num_triangulated < m_min_features) {
+        LOG_WARN("  [MonoInit] Not enough triangulated points");
         return false;
     }
     
     // 7. Validate initialization quality
     float mean_reproj_error = 0.0f;
     if (!ValidateInitialization(bearings1, bearings2, points3d, R, t, inlier_mask, mean_reproj_error)) {
+        LOG_WARN("  [MonoInit] Validation failed, mean_reproj={:.2f}px", mean_reproj_error);
         return false;
     }
+    
+    LOG_INFO("  [MonoInit] Validation passed, mean_reproj={:.2f}px", mean_reproj_error);
     
     // 8. Normalize scale: median depth = 1.0 (like lightweight_vio)
     float scale_factor = NormalizeScale(points3d, t);
@@ -148,11 +168,11 @@ bool Initializer::TryMonocularInitialization(
     // 9. Set frame poses
     // Essential matrix gives us camera-to-camera transformation T_c1c2
     // T_c1c2 = [R | t]: transforms points from camera1 frame to camera2 frame
-    // We need to convert camera poses to body poses using T_BC (body-to-camera)
+    // We need to convert camera poses to body poses using T_BC (camera-to-body)
     
     // Get extrinsic transformation
-    Eigen::Matrix4f T_BC = frame1->GetTBC();  // body-to-camera
-    Eigen::Matrix4f T_CB = T_BC.inverse();    // camera-to-body
+    Eigen::Matrix4f T_BC = frame1->GetTBC();  // camera-to-body (c → b)
+    Eigen::Matrix4f T_CB = T_BC.inverse();    // body-to-camera (b → c)
     
     // Camera1 is at world origin: T_wc1 = Identity
     // Body1 pose: T_wb1 = T_wc1 * T_cb = T_cb
@@ -533,6 +553,9 @@ bool Initializer::ComputeEssentialMatrix(
     // Check if we have enough inliers
     float inlier_ratio = static_cast<float>(best_inliers) / num_points;
     
+    LOG_INFO("  [Essential] best_inliers={}, num_points={}, ratio={:.2f} (min={:.2f})", 
+             best_inliers, num_points, inlier_ratio, m_min_inlier_ratio);
+    
     if (inlier_ratio < m_min_inlier_ratio) {
         return false;
     }
@@ -666,17 +689,10 @@ int Initializer::TriangulatePoints(
         
         // Triangulate using mid-point method
         if (TriangulateSinglePoint(bearings1[i], bearings2[i], R, t, point3d)) {
-            // Verify depth positivity (cheirality check)
-            float depth1 = bearings1[i].dot(point3d);
-            Eigen::Vector3f point3d_in_frame2 = R * point3d + t;
-            float depth2 = bearings2[i].dot(point3d_in_frame2);
-            
-            if (depth1 > 0 && depth2 > 0) {
-                points3d.push_back(point3d);
-                success_count++;
-            } else {
-                points3d.push_back(Eigen::Vector3f::Zero());  // Mark as invalid
-            }
+            // For 360 cameras, skip cheirality check (depth can be negative)
+            // The validity is already checked in TriangulateSinglePoint
+            points3d.push_back(point3d);
+            success_count++;
         } else {
             points3d.push_back(Eigen::Vector3f::Zero());  // Triangulation failed
         }
@@ -700,6 +716,21 @@ bool Initializer::TriangulateSinglePoint(
     // Transform bearing2 to frame1 coordinates
     const Eigen::Vector3f bearing2_in_frame1 = R.transpose() * bearing2;
     
+    // Stella VSLAM style: Check ray directions before triangulation
+    // cos_rays_parallax must be positive (rays must point in similar direction)
+    const float cos_rays_parallax = bearing1.dot(bearing2_in_frame1);
+    if (cos_rays_parallax <= 0.0f) {
+        // Rays pointing in opposite directions - invalid for triangulation
+        return false;
+    }
+    
+    // Also check for minimum parallax (Stella VSLAM uses ~1 degree threshold)
+    constexpr float cos_rays_parallax_thr = 0.9998f;  // cos(1 degree) ≈ 0.9998
+    if (cos_rays_parallax >= cos_rays_parallax_thr) {
+        // Insufficient parallax - rays are too parallel
+        return false;
+    }
+    
     // Build the linear system: A * lambda = b
     // Ray1: p1 = λ1 * bearing1
     // Ray2: p2 = λ2 * bearing2_in_frame1 + trans_12
@@ -714,11 +745,26 @@ bool Initializer::TriangulateSinglePoint(
     b(0) = bearing1.dot(trans_12);
     b(1) = bearing2_in_frame1.dot(trans_12);
     
+    // Check for degenerate matrix
+    float det = A(0,0) * A(1,1) - A(0,1) * A(1,0);
+    if (std::abs(det) < 1e-10f) {
+        return false;
+    }
+    
     // Solve for lambda
     const Eigen::Vector2f lambda = A.inverse() * b;
     
-    // Check if depths are positive
-    if (lambda(0) < 0 || lambda(1) < 0) {
+    // For valid triangulation, both lambda values should be positive
+    // (point should be in front of both rays in their respective directions)
+    if (lambda(0) <= 0.0f || lambda(1) <= 0.0f) {
+        return false;
+    }
+    
+    // Check for reasonable depth range
+    constexpr float kMinDepth = 0.01f;
+    constexpr float kMaxDepth = 100.0f;
+    if (lambda(0) < kMinDepth || lambda(1) < kMinDepth ||
+        lambda(0) > kMaxDepth || lambda(1) > kMaxDepth) {
         return false;
     }
     
@@ -750,19 +796,49 @@ int Initializer::TestPoseCandidate(
             continue;
         }
         
-        // Cheirality check 1: Point must be in front of camera 1
-        float depth1 = bearings1[i].dot(point3d);
-        if (depth1 <= 0) continue;
-        
-        // Cheirality check 2: Point must be in front of camera 2
-        Eigen::Vector3f point3d_in_frame2 = R * point3d + t;
-        float depth2 = bearings2[i].dot(point3d_in_frame2);
-        if (depth2 <= 0) continue;
+        // For 360 cameras, skip cheirality check as the camera can see all directions.
+        // The point validity is already checked in TriangulateSinglePoint.
         
         good_points++;
     }
     
     return good_points;
+}
+
+float Initializer::ComputeReprojectionErrorInFrame(
+    const Eigen::Vector3f& point3d_in_frame,
+    const Eigen::Vector3f& bearing_observed
+) const {
+    // Stella VSLAM style: project 3D point to pixel coordinates
+    // point3d_in_frame: 3D point already in the frame's coordinate system
+    // bearing_observed: observed bearing in the same frame (normalized)
+    
+    float L = point3d_in_frame.norm();
+    if (L < 1e-6f) {
+        return 1000.0f;  // Invalid point
+    }
+    
+    // Stella VSLAM cam_project: theta = atan2(x, z), phi = -asin(y/L)
+    // u = cols * (0.5 + theta/(2*pi)), v = rows * (0.5 - phi/pi)
+    
+    // Observed bearing -> pixel (bearing is already normalized)
+    float theta_obs = std::atan2(bearing_observed.x(), bearing_observed.z());
+    float phi_obs = -std::asin(std::clamp(bearing_observed.y(), -1.0f, 1.0f));
+    float u_obs = m_camera_width * (0.5f + theta_obs / (2.0f * M_PI));
+    float v_obs = m_camera_height * (0.5f - phi_obs / M_PI);
+    
+    // Projected point -> pixel (normalize then project)
+    Eigen::Vector3f bearing_proj = point3d_in_frame / L;
+    float theta_proj = std::atan2(bearing_proj.x(), bearing_proj.z());
+    float phi_proj = -std::asin(std::clamp(bearing_proj.y(), -1.0f, 1.0f));
+    float u_proj = m_camera_width * (0.5f + theta_proj / (2.0f * M_PI));
+    float v_proj = m_camera_height * (0.5f - phi_proj / M_PI);
+    
+    // Simple pixel error (Stella VSLAM style - no wrap-around)
+    float du = u_obs - u_proj;
+    float dv = v_obs - v_proj;
+    
+    return std::sqrt(du * du + dv * dv);
 }
 
 float Initializer::ComputeReprojectionError(
@@ -775,39 +851,10 @@ float Initializer::ComputeReprojectionError(
     // R: rotation from frame1 to frame2
     // t: translation from frame1 to frame2
     
-    // Transform 3D point to frame2 coordinate (correct transformation)
+    // Transform 3D point to frame2 coordinate
     Eigen::Vector3f point_in_frame2 = R * point3d + t;
     
-    // Normalize to bearing vector
-    Eigen::Vector3f bearing_projected = point_in_frame2.normalized();
-    
-    // Convert observed bearing to pixel coordinates (equirectangular projection)
-    float lon_obs = std::atan2(bearing_observed.x(), bearing_observed.z());
-    float lat_obs = -std::asin(bearing_observed.y());
-    float u_obs = m_camera_width * (0.5f + lon_obs / (2.0f * M_PI));
-    float v_obs = m_camera_height * (0.5f - lat_obs / M_PI);
-    
-    // Convert projected bearing to pixel coordinates
-    float lon_proj = std::atan2(bearing_projected.x(), bearing_projected.z());
-    float lat_proj = -std::asin(bearing_projected.y());
-    float u_proj = m_camera_width * (0.5f + lon_proj / (2.0f * M_PI));
-    float v_proj = m_camera_height * (0.5f - lat_proj / M_PI);
-    
-    // Handle equirectangular wraparound for longitude (±180 degrees)
-    float du = u_obs - u_proj;
-    // If difference is more than half the image width, wrap around
-    if (du > m_camera_width / 2.0f) {
-        du -= m_camera_width;
-    } else if (du < -m_camera_width / 2.0f) {
-        du += m_camera_width;
-    }
-    
-    float dv = v_obs - v_proj;
-    
-    // Compute pixel error (Euclidean distance)
-    float pixel_error = std::sqrt(du * du + dv * dv);
-    
-    return pixel_error;
+    return ComputeReprojectionErrorInFrame(point_in_frame2, bearing_observed);
 }
 
 bool Initializer::ValidateInitialization(
@@ -819,30 +866,72 @@ bool Initializer::ValidateInitialization(
     const std::vector<bool>& inlier_mask,
     float& mean_error
 ) const {
+    // Stella VSLAM style validation:
+    // Check reprojection error in BOTH frames (ref and cur)
+    
     int valid_count = 0;
     int total_inliers = 0;
+    int skip_zero = 0;
+    int skip_ref = 0;
+    int skip_cur = 0;
     std::vector<float> errors_pixel;
     float error_sum = 0.0f;
+    
+    const float reproj_err_thr_sq = m_max_reprojection_error * m_max_reprojection_error;
     
     for (size_t i = 0; i < points3d.size(); ++i) {
         if (!inlier_mask[i]) continue;
         total_inliers++;
         
-        // Skip invalid points (zero vector)
-        if (points3d[i].norm() < 1e-6) continue;
-        
-        // Compute reprojection error in frame2 (now returns pixel error directly)
-        float error_pixel = ComputeReprojectionError(points3d[i], bearings2[i], R, t);
-        
-        errors_pixel.push_back(error_pixel);
-        error_sum += error_pixel;
-        
-        if (error_pixel < m_max_reprojection_error) {
-            valid_count++;
+        // Skip invalid points (zero vector - triangulation failed)
+        if (points3d[i].norm() < 1e-6) {
+            skip_zero++;
+            continue;
         }
+        
+        const Eigen::Vector3f& pt = points3d[i];
+        
+        // Stella VSLAM style: check reprojection error in BOTH frames
+        
+        // 1. Reprojection error in frame1 (reference)
+        float error_ref = ComputeReprojectionErrorInFrame(pt, bearings1[i]);
+        
+        // DEBUG: Show first few points
+        if (total_inliers <= 5) {
+            Eigen::Vector3f b1 = bearings1[i];
+            Eigen::Vector3f pt_dir = pt.normalized();
+            float dot = pt_dir.dot(b1);
+            LOG_INFO("  [DBG] pt[{}]: pt=({:.3f},{:.3f},{:.3f}), b1=({:.3f},{:.3f},{:.3f}), dot={:.3f}, err_ref={:.2f}px",
+                     i, pt.x(), pt.y(), pt.z(), b1.x(), b1.y(), b1.z(), dot, error_ref);
+        }
+        
+        if (error_ref > m_max_reprojection_error) {
+            skip_ref++;
+            continue;
+        }
+        
+        // 2. Reprojection error in frame2 (current)
+        // Transform point to frame2: P_cur = R * P_ref + t
+        Eigen::Vector3f point_in_frame2 = R * pt + t;
+        float error_cur = ComputeReprojectionErrorInFrame(point_in_frame2, bearings2[i]);
+        
+        if (error_cur > m_max_reprojection_error) {
+            skip_cur++;
+            continue;
+        }
+        
+        // Use max of both errors for statistics
+        float max_error = std::max(error_ref, error_cur);
+        errors_pixel.push_back(max_error);
+        error_sum += max_error;
+        valid_count++;
     }
     
+    LOG_INFO("  [Validate] Stats: total_inliers={}, skip_zero={}, skip_ref={}, skip_cur={}, valid={}",
+             total_inliers, skip_zero, skip_ref, skip_cur, valid_count);
+    
     if (errors_pixel.empty()) {
+        LOG_WARN("  [Validate] FAIL: No valid points! total_inliers={}", total_inliers);
         mean_error = 0.0f;
         return false;
     }
@@ -854,13 +943,28 @@ bool Initializer::ValidateInitialization(
     std::sort(errors_pixel.begin(), errors_pixel.end());
     float valid_ratio = static_cast<float>(valid_count) / total_inliers;
     
+    LOG_INFO("  [Validate] valid={}/{} ({:.1f}%), mean_err={:.2f}px, median={:.2f}px",
+             valid_count, total_inliers, valid_ratio * 100.0f, mean_error,
+             errors_pixel[errors_pixel.size() / 2]);
+    LOG_INFO("  [Validate] thresholds: max_reproj={:.2f}px, min_ratio={:.2f}, min_features={}",
+             m_max_reprojection_error, m_min_inlier_ratio, m_min_features);
+    
+    // DEBUG: Show error distribution
+    size_t n = errors_pixel.size();
+    LOG_INFO("  [Validate] Error distribution: min={:.2f}, 25%={:.2f}, 50%={:.2f}, 75%={:.2f}, 90%={:.2f}, 95%={:.2f}, max={:.2f}",
+             errors_pixel[0], errors_pixel[n/4], errors_pixel[n/2], 
+             errors_pixel[3*n/4], errors_pixel[std::min(n-1, (size_t)(n*0.9))],
+             errors_pixel[std::min(n-1, (size_t)(n*0.95))], errors_pixel[n-1]);
+    
     // Validation check 1: Inlier ratio
     if (valid_ratio < m_min_inlier_ratio) {
+        LOG_WARN("  [Validate] FAIL: valid_ratio {:.2f} < min_ratio {:.2f}", valid_ratio, m_min_inlier_ratio);
         return false;
     }
     
     // Validation check 2: Minimum number of points
     if (valid_count < m_min_features) {
+        LOG_WARN("  [Validate] FAIL: valid_count {} < min_features {}", valid_count, m_min_features);
         return false;
     }
     
@@ -1114,15 +1218,15 @@ double Initializer::ComputeFrameReprojectionError(const std::shared_ptr<Frame>& 
         
         if (L < 1e-6) continue;
         
-        // Equirectangular projection - MUST match Camera.cpp PixelToBearing!
-        // Camera.cpp: x=cos(lat)*cos(lon), y=cos(lat)*sin(lon), z=sin(lat)
-        // So: lon=atan2(y,x), lat=atan2(z, sqrt(x²+y²))
-        double lon = std::atan2(pcy, pcx);  // [-π, π]
-        double lat = std::atan2(pcz, std::sqrt(pcx*pcx + pcy*pcy));  // [-π/2, π/2]
+        // Equirectangular projection - Stella VSLAM compatible
+        // Camera frame: X-right, Y-down, Z-forward
+        // theta = atan2(x, z), phi = -asin(y/L)
+        double theta = std::atan2(pcx, pcz);  // [-π, π]
+        double phi = -std::asin(pcy / L);     // [-π/2, π/2]
         
-        // u = (lon + π) / (2π) * cols, v = (π/2 - lat) / π * rows
-        double proj_u = (lon + M_PI) / (2.0 * M_PI) * cols;
-        double proj_v = (M_PI / 2.0 - lat) / M_PI * rows;
+        // u = cols * (0.5 + theta/(2π)), v = rows * (0.5 - phi/π)
+        double proj_u = cols * (0.5 + theta / (2.0 * M_PI));
+        double proj_v = rows * (0.5 - phi / M_PI);
         
         // Compute pixel error
         double du = obs_u - proj_u;

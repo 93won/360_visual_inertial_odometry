@@ -20,20 +20,25 @@ Camera::Camera(int width, int height)
 }
 
 Eigen::Vector3f Camera::PixelToBearing(const cv::Point2f& pixel) const {
+    // Stella VSLAM compatible equirectangular projection
+    // Camera frame: X-right, Y-down, Z-forward
+    
     // Normalize pixel coordinates
     float u_norm = pixel.x / static_cast<float>(m_width);   // [0, 1]
     float v_norm = pixel.y / static_cast<float>(m_height);  // [0, 1]
     
-    // Convert to longitude and latitude
-    float lon = u_norm * 2.0f * M_PI - M_PI;           // [-π, π]
-    float lat = M_PI / 2.0f - v_norm * M_PI;           // [π/2, -π/2]
+    // Convert to longitude and latitude (Stella VSLAM convention)
+    // lon (theta): horizontal angle from Z-axis, positive to the right (X direction)
+    // lat (phi): vertical angle from XZ plane, positive downward (Y direction)
+    float lon = (u_norm - 0.5f) * 2.0f * M_PI;        // [-π, π]
+    float lat = -(v_norm - 0.5f) * M_PI;              // [π/2, -π/2] (negated for Y-down)
     
-    // Spherical to Cartesian coordinates
+    // Spherical to Cartesian (Stella VSLAM convention: X-right, Y-down, Z-forward)
     float cos_lat = std::cos(lat);
     Eigen::Vector3f bearing;
-    bearing.x() = cos_lat * std::cos(lon);
-    bearing.y() = cos_lat * std::sin(lon);
-    bearing.z() = std::sin(lat);
+    bearing.x() = cos_lat * std::sin(lon);   // X: right
+    bearing.y() = -std::sin(lat);            // Y: down (negative sin for Y-down convention)
+    bearing.z() = cos_lat * std::cos(lon);   // Z: forward
     
     // Normalize (should already be unit vector, but ensure it)
     bearing.normalize();
@@ -42,20 +47,21 @@ Eigen::Vector3f Camera::PixelToBearing(const cv::Point2f& pixel) const {
 }
 
 cv::Point2f Camera::BearingToPixel(const Eigen::Vector3f& bearing) const {
-    // Cartesian to spherical coordinates
-    float lon = std::atan2(bearing.y(), bearing.x());           // [-π, π]
-    float lat = std::atan2(bearing.z(), 
-                          std::sqrt(bearing.x() * bearing.x() + 
-                                   bearing.y() * bearing.y()));  // [-π/2, π/2]
+    // Stella VSLAM compatible equirectangular projection
+    // Camera frame: X-right, Y-down, Z-forward
     
-    // Convert to normalized pixel coordinates
-    float u_norm = (lon + M_PI) / (2.0f * M_PI);     // [0, 1]
-    float v_norm = (M_PI / 2.0f - lat) / M_PI;       // [0, 1]
+    // Cartesian to spherical (Stella VSLAM convention)
+    // theta (lon) = atan2(x, z) - horizontal angle from Z-axis
+    // phi (lat) = -asin(y / L) - vertical angle (negated for Y-down)
+    float theta = std::atan2(bearing.x(), bearing.z());                    // [-π, π]
+    float phi = -std::asin(bearing.y() / bearing.norm());                  // [-π/2, π/2]
     
     // Convert to pixel coordinates
+    // u = cols * (0.5 + theta / (2π))
+    // v = rows * (0.5 - phi / π)
     cv::Point2f pixel;
-    pixel.x = u_norm * static_cast<float>(m_width);
-    pixel.y = v_norm * static_cast<float>(m_height);
+    pixel.x = static_cast<float>(m_width) * (0.5f + theta / (2.0f * M_PI));
+    pixel.y = static_cast<float>(m_height) * (0.5f - phi / M_PI);
     
     return pixel;
 }

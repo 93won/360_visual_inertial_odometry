@@ -235,6 +235,17 @@ private:
     ) const;
     
     /**
+     * @brief Compute reprojection error in a single frame (Stella VSLAM style)
+     * @param point3d_in_frame 3D point in frame's coordinate system
+     * @param bearing_observed Observed bearing vector in that frame
+     * @return Reprojection error in pixels
+     */
+    float ComputeReprojectionErrorInFrame(
+        const Eigen::Vector3f& point3d_in_frame,
+        const Eigen::Vector3f& bearing_observed
+    ) const;
+    
+    /**
      * @brief Validate initialization quality
      * @param bearings1 Bearing vectors from frame1
      * @param bearings2 Bearing vectors from frame2

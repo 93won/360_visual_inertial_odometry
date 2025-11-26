@@ -148,6 +148,25 @@ public:
      * @return Vector of all keyframes
      */
     const std::vector<std::shared_ptr<Frame>>& GetKeyframes() const { return m_keyframes; }
+    
+    /**
+     * @brief Get all keyframes including those outside the window
+     * @return Vector of all keyframes ever created
+     */
+    const std::vector<std::shared_ptr<Frame>>& GetAllKeyframes() const { return m_all_keyframes; }
+    
+    /**
+     * @brief Check if a keyframe is in the current sliding window
+     * @param frame_id Frame ID to check
+     * @return True if the keyframe is in the window
+     */
+    bool IsKeyframeInWindow(int frame_id) const;
+    
+    /**
+     * @brief Get the number of keyframes in the sliding window
+     * @return Number of keyframes in window
+     */
+    int GetWindowSize() const { return static_cast<int>(m_keyframes.size()); }
 
 private:
     // System components
@@ -161,7 +180,8 @@ private:
     std::shared_ptr<Frame> m_previous_frame;
     std::shared_ptr<Frame> m_last_keyframe;
     std::vector<std::shared_ptr<Frame>> m_all_frames;
-    std::vector<std::shared_ptr<Frame>> m_keyframes;
+    std::vector<std::shared_ptr<Frame>> m_keyframes;         // Sliding window keyframes
+    std::vector<std::shared_ptr<Frame>> m_all_keyframes;     // All keyframes (including out of window)
     
     // Frame window for initialization
     std::vector<std::shared_ptr<Frame>> m_frame_window;

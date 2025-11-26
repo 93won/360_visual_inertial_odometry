@@ -47,13 +47,14 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
     // Convert tangent space to SE3 using Sophus exp (consistent with parameterization)
     vio_360::SE3d T_wb = vio_360::SE3d::exp(se3_tangent);
     
-    // Convert T_wb to T_cw transformation
+    // Convert T_wb (b→w) to T_cw (w→c) transformation
     Eigen::Matrix3d R_wb = T_wb.rotationMatrix();
     Eigen::Vector3d t_wb = T_wb.translation();
-    Eigen::Matrix3d R_bw = R_wb.transpose();
-    Eigen::Vector3d t_bw = -R_bw * t_wb;
+    Eigen::Matrix3d R_bw = R_wb.transpose();        // w→b rotation
+    Eigen::Vector3d t_bw = -R_bw * t_wb;            // w→b translation
     
-    // T_cw = T_cb * T_bw
+    // T_cw = T_cb * T_bw  (w→b then b→c = w→c)
+    // m_Tcb is T_cb (b→c, body to camera)
     Eigen::Matrix3d R_cw = m_Tcb.block<3, 3>(0, 0) * R_bw;
     Eigen::Vector3d t_cw = m_Tcb.block<3, 3>(0, 0) * t_bw + m_Tcb.block<3, 1>(0, 3);
     
@@ -74,17 +75,18 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
         return false;
     }
     
-    // Equirectangular projection - MUST match Camera.cpp PixelToBearing!
-    // Camera.cpp: x=cos(lat)*cos(lon), y=cos(lat)*sin(lon), z=sin(lat)
-    // So: lon=atan2(y,x), lat=atan2(z, sqrt(x²+y²))
+    // Equirectangular projection - Stella VSLAM compatible
+    // Camera frame: X-right, Y-down, Z-forward
+    // theta = atan2(x, z), phi = -asin(y/L)
+    // u = cols * (0.5 + theta/(2π)), v = rows * (0.5 - phi/π)
     double cols = m_camera_params.cols;
     double rows = m_camera_params.rows;
     
-    double lon = std::atan2(pcy, pcx);  // [-π, π]
-    double lat = std::atan2(pcz, std::sqrt(pcx*pcx + pcy*pcy));  // [-π/2, π/2]
+    double theta = std::atan2(pcx, pcz);  // [-π, π]
+    double phi = -std::asin(pcy / L);     // [-π/2, π/2]
     
-    double u = (lon + M_PI) / (2.0 * M_PI) * cols;
-    double v = (M_PI / 2.0 - lat) / M_PI * rows;
+    double u = cols * (0.5 + theta / (2.0 * M_PI));
+    double v = rows * (0.5 - phi / M_PI);
     
     // Compute residuals: observation - projection
     Eigen::Vector2d residual_vec;
@@ -108,29 +110,33 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
     if (jacobians && jacobians[0]) {
         Eigen::Map<Eigen::Matrix<double, 2, 6, Eigen::RowMajor>> jac(jacobians[0]);
         
-        // Jacobian calculation
+        // Jacobian calculation - Stella VSLAM compatible
         // Camera extrinsic rotation matrix
         Eigen::Matrix3d Rcb = m_Tcb.block<3, 3>(0, 0);
         
         // Body frame coordinates: Pb = Rbw * Pw + tbw
         Eigen::Vector3d Pb = R_bw * m_world_point + t_bw;
         
-        // Equirectangular Jacobian matching Camera.cpp
-        // u = (atan2(y,x) + π) / (2π) * cols
-        // v = (π/2 - atan2(z, sqrt(x²+y²))) / π * rows
-        // ∂u/∂x = cols/(2π) * (-y)/(x²+y²)
-        // ∂u/∂y = cols/(2π) * x/(x²+y²)
-        // ∂u/∂z = 0
-        // ∂v/∂x = rows/π * xz / (L² * sqrt(x²+y²))
-        // ∂v/∂y = rows/π * yz / (L² * sqrt(x²+y²))
-        // ∂v/∂z = rows/π * (-sqrt(x²+y²)) / L²
+        // Equirectangular Jacobian - Stella VSLAM convention
+        // theta = atan2(x, z), phi = -asin(y/L)
+        // u = cols * (0.5 + theta/(2π)), v = rows * (0.5 - phi/π)
+        // 
+        // ∂theta/∂x = z/(x²+z²), ∂theta/∂z = -x/(x²+z²)
+        // ∂phi/∂y = -1/(L*sqrt(1-(y/L)²)) = -1/sqrt(x²+z²)
+        // ∂phi/∂x = xy/(L²*sqrt(x²+z²)), ∂phi/∂z = yz/(L²*sqrt(x²+z²))
+        //
+        // ∂u/∂x = cols/(2π) * z/(x²+z²)
+        // ∂u/∂z = -cols/(2π) * x/(x²+z²)
+        // ∂v/∂x = -rows/π * xy/(L²*sqrt(x²+z²))
+        // ∂v/∂y = rows/π * sqrt(x²+z²)/L²
+        // ∂v/∂z = -rows/π * yz/(L²*sqrt(x²+z²))
         
-        double xy_sq = pcx * pcx + pcy * pcy;
+        double xz_sq = pcx * pcx + pcz * pcz;
         double L_sq = L * L;
-        double xy_norm = std::sqrt(xy_sq);
+        double xz_norm = std::sqrt(xz_sq);
         
         // Avoid division by zero
-        if (xy_sq < 1e-10 || L_sq < 1e-10) {
+        if (xz_sq < 1e-10 || L_sq < 1e-10) {
             jac.setZero();
             return true;
         }
@@ -140,12 +146,12 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
         
         Eigen::Matrix<double, 2, 3> J_error_wrt_Pc;
         // Note: residual = obs - proj, so ∂residual/∂Pc = -∂proj/∂Pc
-        J_error_wrt_Pc(0, 0) = cols / (2.0 * M_PI) * pcy / xy_sq;   // -(-y/(x²+y²))
-        J_error_wrt_Pc(0, 1) = -cols / (2.0 * M_PI) * pcx / xy_sq;  // -(x/(x²+y²))
-        J_error_wrt_Pc(0, 2) = 0.0;
-        J_error_wrt_Pc(1, 0) = -rows / M_PI * (pcx * pcz) / (L_sq * xy_norm);
-        J_error_wrt_Pc(1, 1) = -rows / M_PI * (pcy * pcz) / (L_sq * xy_norm);
-        J_error_wrt_Pc(1, 2) = rows / M_PI * xy_norm / L_sq;
+        J_error_wrt_Pc(0, 0) = -cols / (2.0 * M_PI) * pcz / xz_sq;   // -∂u/∂x
+        J_error_wrt_Pc(0, 1) = 0.0;                                   // -∂u/∂y = 0
+        J_error_wrt_Pc(0, 2) = cols / (2.0 * M_PI) * pcx / xz_sq;    // -∂u/∂z
+        J_error_wrt_Pc(1, 0) = rows / M_PI * (pcx * pcy) / (L_sq * xz_norm);   // -∂v/∂x
+        J_error_wrt_Pc(1, 1) = -rows / M_PI * xz_norm / L_sq;        // -∂v/∂y
+        J_error_wrt_Pc(1, 2) = rows / M_PI * (pcy * pcz) / (L_sq * xz_norm);   // -∂v/∂z
         
         // Chain rule: ∂(error)/∂(twist) = ∂(error)/∂(Pc) * ∂(Pc)/∂(twist)
         
@@ -179,13 +185,13 @@ double PnPFactor::compute_chi_square(double const* const* parameters) const {
     // Convert tangent space to SE3 using Sophus exp (consistent with parameterization)
     vio_360::SE3d T_wb = vio_360::SE3d::exp(se3_tangent);
     
-    // Convert T_wb to T_cw transformation
+    // Convert T_wb (b→w) to T_cw (w→c) transformation
     Eigen::Matrix3d R_wb = T_wb.rotationMatrix();
     Eigen::Vector3d t_wb = T_wb.translation();
-    Eigen::Matrix3d R_bw = R_wb.transpose();
-    Eigen::Vector3d t_bw = -R_bw * t_wb;
+    Eigen::Matrix3d R_bw = R_wb.transpose();        // w→b rotation
+    Eigen::Vector3d t_bw = -R_bw * t_wb;            // w→b translation
     
-    // T_cw = T_cb * T_bw
+    // T_cw = T_cb * T_bw  (w→b then b→c = w→c)
     Eigen::Matrix3d R_cw = m_Tcb.block<3, 3>(0, 0) * R_bw;
     Eigen::Vector3d t_cw = m_Tcb.block<3, 3>(0, 0) * t_bw + m_Tcb.block<3, 1>(0, 3);
     
@@ -202,15 +208,15 @@ double PnPFactor::compute_chi_square(double const* const* parameters) const {
         return std::numeric_limits<double>::max(); // Invalid, return large chi-square
     }
     
-    // Equirectangular projection - MUST match Camera.cpp PixelToBearing!
+    // Equirectangular projection - Stella VSLAM compatible
     double cols = m_camera_params.cols;
     double rows = m_camera_params.rows;
     
-    double lon = std::atan2(pcy, pcx);  // [-π, π]
-    double lat = std::atan2(pcz, std::sqrt(pcx*pcx + pcy*pcy));  // [-π/2, π/2]
+    double theta = std::atan2(pcx, pcz);  // [-π, π]
+    double phi = -std::asin(pcy / L);     // [-π/2, π/2]
     
-    double u = (lon + M_PI) / (2.0 * M_PI) * cols;
-    double v = (M_PI / 2.0 - lat) / M_PI * rows;
+    double u = cols * (0.5 + theta / (2.0 * M_PI));
+    double v = rows * (0.5 - phi / M_PI);
     
     // Compute residuals: observation - projection
     Eigen::Vector2d residual_vec;
@@ -304,15 +310,16 @@ bool BAFactor::Evaluate(double const* const* parameters,
             return true;
         }
 
-        // Equirectangular projection - MUST match Camera.cpp PixelToBearing!
+        // Equirectangular projection - Stella VSLAM compatible
+        // Camera frame: X-right, Y-down, Z-forward
         double cols = m_camera_params.cols;
         double rows = m_camera_params.rows;
         
-        double lon = std::atan2(pcy, pcx);  // [-π, π]
-        double lat = std::atan2(pcz, std::sqrt(pcx*pcx + pcy*pcy));  // [-π/2, π/2]
+        double theta = std::atan2(pcx, pcz);  // [-π, π]
+        double phi = -std::asin(pcy / L);     // [-π/2, π/2]
         
-        double u = (lon + M_PI) / (2.0 * M_PI) * cols;
-        double v = (M_PI / 2.0 - lat) / M_PI * rows;
+        double u = cols * (0.5 + theta / (2.0 * M_PI));
+        double v = rows * (0.5 - phi / M_PI);
         
         // Compute residual: observed - projected
         Eigen::Vector2d projected(u, v);
@@ -334,13 +341,14 @@ bool BAFactor::Evaluate(double const* const* parameters,
         
         // Compute Jacobians if requested
         if (jacobians) {
-            // Equirectangular projection Jacobian matching Camera.cpp
-            double xy_sq = pcx * pcx + pcy * pcy;
+            // Equirectangular projection Jacobian - Stella VSLAM convention
+            // theta = atan2(x, z), phi = -asin(y/L)
+            double xz_sq = pcx * pcx + pcz * pcz;
             double L_sq = L * L;
-            double xy_norm = std::sqrt(xy_sq);
+            double xz_norm = std::sqrt(xz_sq);
             
             // Check for singularity
-            if (xy_sq < 1e-10 || L_sq < 1e-10) {
+            if (xz_sq < 1e-10 || L_sq < 1e-10) {
                 if (jacobians[0]) {
                     Eigen::Map<Eigen::Matrix<double, 2, 6, Eigen::RowMajor>> jac_pose(jacobians[0]);
                     jac_pose.setZero();
@@ -357,12 +365,12 @@ bool BAFactor::Evaluate(double const* const* parameters,
             
             Eigen::Matrix<double, 2, 3> J_proj_camera;
             // Note: residual = obs - proj, so ∂residual/∂Pc = -∂proj/∂Pc
-            J_proj_camera(0, 0) = cols / (2.0 * M_PI) * pcy / xy_sq;   // -(-y/(x²+y²))
-            J_proj_camera(0, 1) = -cols / (2.0 * M_PI) * pcx / xy_sq;  // -(x/(x²+y²))
-            J_proj_camera(0, 2) = 0.0;
-            J_proj_camera(1, 0) = -rows / M_PI * (pcx * pcz) / (L_sq * xy_norm);
-            J_proj_camera(1, 1) = -rows / M_PI * (pcy * pcz) / (L_sq * xy_norm);
-            J_proj_camera(1, 2) = rows / M_PI * xy_norm / L_sq;
+            J_proj_camera(0, 0) = -cols / (2.0 * M_PI) * pcz / xz_sq;   // -∂u/∂x
+            J_proj_camera(0, 1) = 0.0;                                   // -∂u/∂y = 0
+            J_proj_camera(0, 2) = cols / (2.0 * M_PI) * pcx / xz_sq;    // -∂u/∂z
+            J_proj_camera(1, 0) = rows / M_PI * (pcx * pcy) / (L_sq * xz_norm);   // -∂v/∂x
+            J_proj_camera(1, 1) = -rows / M_PI * xz_norm / L_sq;        // -∂v/∂y
+            J_proj_camera(1, 2) = rows / M_PI * (pcy * pcz) / (L_sq * xz_norm);   // -∂v/∂z
             
             // Apply information matrix weighting to projection jacobian using Cholesky
             Eigen::LLT<Eigen::Matrix2d> llt_jac(m_information);
@@ -463,15 +471,15 @@ double BAFactor::compute_chi_square(double const* const* parameters) const {
         return 1000.0; // Large chi-square for invalid points
     }
     
-    // Equirectangular projection - MUST match Camera.cpp PixelToBearing!
+    // Equirectangular projection - Stella VSLAM compatible
     double cols = m_camera_params.cols;
     double rows = m_camera_params.rows;
     
-    double lon = std::atan2(pcy, pcx);  // [-π, π]
-    double lat = std::atan2(pcz, std::sqrt(pcx*pcx + pcy*pcy));  // [-π/2, π/2]
+    double theta = std::atan2(pcx, pcz);  // [-π, π]
+    double phi = -std::asin(pcy / L);     // [-π/2, π/2]
     
-    double u = (lon + M_PI) / (2.0 * M_PI) * cols;
-    double v = (M_PI / 2.0 - lat) / M_PI * rows;
+    double u = cols * (0.5 + theta / (2.0 * M_PI));
+    double v = rows * (0.5 - phi / M_PI);
     
     // Compute unweighted error
     Eigen::Vector2d projected(u, v);

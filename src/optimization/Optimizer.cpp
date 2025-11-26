@@ -171,6 +171,7 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         const double* params_ptr = pose_params;
         int num_inliers = 0;
         int num_outliers = 0;
+        double inlier_reproj_sum = 0.0;
         
         for (size_t i = 0; i < factors.size(); ++i) {
             double chi2 = factors[i]->compute_chi_square(&params_ptr);
@@ -188,6 +189,8 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
                 num_outliers++;
             } else {
                 num_inliers++;
+                // Accumulate inlier reprojection error (sqrt of chi2 for pixel error)
+                inlier_reproj_sum += std::sqrt(chi2);
             }
         }
         
@@ -195,6 +198,11 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         result.num_inliers = num_inliers;
         result.num_outliers = num_outliers;
         result.success = summary.IsSolutionUsable();
+        
+        // Compute mean inlier reprojection error
+        if (num_inliers > 0) {
+            final_cost = inlier_reproj_sum / num_inliers;
+        }
     }
     
     // Update frame pose with final optimized value
@@ -202,7 +210,7 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
     frame->SetTwb(result.optimized_pose);
     
     result.initial_cost = initial_cost;
-    result.final_cost = final_cost;
+    result.final_cost = final_cost;  // Now this is mean inlier reprojection error in pixels
     result.num_iterations = total_iterations;
     
     return result;
@@ -334,24 +342,25 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
         }
     }
     
-    // Mark MapPoints as bad if mostly outliers
+    // Mark MapPoints as bad only if ALWAYS outlier (never inlier in any observation)
+    // This is much more conservative - only remove truly bad points
     int bad_mp_count = 0;
     for (size_t i = 0; i < mappoints.size(); ++i) {
         int inliers = mp_inlier_count[i];
         int outliers = mp_outlier_count[i];
         int total = inliers + outliers;
         
-        // Mark as bad only if:
-        // 1. No inliers at all AND has outliers, OR
-        // 2. Outliers are more than 2x inliers
-        if (total > 0 && (inliers == 0 || outliers > 2 * inliers)) {
+        // Only mark as bad if:
+        // 1. Has observations but ZERO inliers (all outliers), AND
+        // 2. Has at least 2 outlier observations (need enough evidence)
+        if (total >= 2 && inliers == 0) {
             mappoints[i]->SetBad(true);
             bad_mp_count++;
         }
     }
     
     if (bad_mp_count > 0) {
-        LOG_INFO("  Marked {} MapPoints as bad", bad_mp_count);
+        LOG_INFO("  Marked {} MapPoints as bad (zero inliers)", bad_mp_count);
     }
     
     // Update frames and MapPoints
@@ -381,6 +390,243 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
 BAResult Optimizer::RunFullBA(const std::vector<std::shared_ptr<Frame>>& frames) {
     // Full BA: fix only first pose, optimize second pose and all MapPoints
     return RunBA(frames, true, false);
+}
+
+BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window_frames) {
+    BAResult result;
+    
+    if (window_frames.size() < 2) {
+        LOG_WARN("RunLocalBA: need at least 2 frames in window");
+        return result;
+    }
+    
+    // Build set of window frame IDs for quick lookup
+    std::set<int> window_frame_ids;
+    for (const auto& frame : window_frames) {
+        window_frame_ids.insert(frame->GetFrameId());
+    }
+    
+    // Step 1: Collect all MapPoints observed by window frames
+    std::set<std::shared_ptr<MapPoint>> mappoint_set;
+    for (const auto& frame : window_frames) {
+        const auto& features = frame->GetFeatures();
+        for (size_t i = 0; i < features.size(); ++i) {
+            const auto& feature = features[i];
+            if (!feature || !feature->IsValid()) continue;
+            auto mp = frame->GetMapPoint(static_cast<int>(i));
+            if (mp && !mp->IsBad()) {
+                mappoint_set.insert(mp);
+            }
+        }
+    }
+    
+    std::vector<std::shared_ptr<MapPoint>> mappoints(mappoint_set.begin(), mappoint_set.end());
+    
+    if (mappoints.empty()) {
+        LOG_WARN("RunLocalBA: no valid MapPoints");
+        return result;
+    }
+    
+    // Step 2: Collect all frames that observe these MapPoints (including out-of-window frames)
+    std::set<std::shared_ptr<Frame>> all_frames_set(window_frames.begin(), window_frames.end());
+    std::set<std::shared_ptr<Frame>> fixed_frames_set;  // Frames outside window (will be fixed)
+    
+    for (const auto& mp : mappoints) {
+        const auto& observations = mp->GetObservations();
+        for (const auto& obs : observations) {
+            auto obs_frame = obs.frame.lock();
+            if (!obs_frame) continue;
+            
+            // Check if this frame is outside the window
+            if (window_frame_ids.find(obs_frame->GetFrameId()) == window_frame_ids.end()) {
+                // Frame is outside window - add to fixed frames
+                all_frames_set.insert(obs_frame);
+                fixed_frames_set.insert(obs_frame);
+            }
+        }
+    }
+    
+    // Convert to vector and create frame index map
+    std::vector<std::shared_ptr<Frame>> all_frames(all_frames_set.begin(), all_frames_set.end());
+    std::map<std::shared_ptr<Frame>, size_t> frame_to_idx;
+    for (size_t i = 0; i < all_frames.size(); ++i) {
+        frame_to_idx[all_frames[i]] = i;
+    }
+    
+    // Parameter blocks
+    std::vector<std::array<double, 6>> pose_params(all_frames.size());
+    std::vector<std::array<double, 3>> point_params(mappoints.size());
+    
+    // Initialize pose parameters
+    for (size_t i = 0; i < all_frames.size(); ++i) {
+        PoseToParams(all_frames[i]->GetTwb(), pose_params[i].data());
+    }
+    
+    // Initialize point parameters and create index map
+    std::map<std::shared_ptr<MapPoint>, size_t> mp_to_idx;
+    for (size_t i = 0; i < mappoints.size(); ++i) {
+        Eigen::Vector3f pos = mappoints[i]->GetPosition();
+        point_params[i] = {pos.x(), pos.y(), pos.z()};
+        mp_to_idx[mappoints[i]] = i;
+    }
+    
+    // Build optimization problem
+    ceres::Problem problem;
+    std::vector<factor::BAFactor*> factors;
+    std::vector<std::pair<size_t, size_t>> factor_indices;  // (frame_idx, mp_idx)
+    
+    // Add residuals for ALL observations of ALL mappoints
+    for (size_t pi = 0; pi < mappoints.size(); ++pi) {
+        const auto& mp = mappoints[pi];
+        const auto& observations = mp->GetObservations();
+        
+        for (const auto& obs : observations) {
+            auto obs_frame = obs.frame.lock();
+            if (!obs_frame) continue;
+            
+            auto frame_it = frame_to_idx.find(obs_frame);
+            if (frame_it == frame_to_idx.end()) continue;
+            
+            size_t fi = frame_it->second;
+            
+            // Get the feature from the observation
+            const auto& features = obs_frame->GetFeatures();
+            if (obs.feature_index < 0 || obs.feature_index >= static_cast<int>(features.size())) continue;
+            
+            const auto& feature = features[obs.feature_index];
+            if (!feature || !feature->IsValid()) continue;
+            
+            // Camera parameters
+            double cols = static_cast<double>(obs_frame->GetWidth());
+            double rows = static_cast<double>(obs_frame->GetHeight());
+            factor::CameraParameters cam_params(cols, rows);
+            
+            Eigen::Matrix4d T_cb = obs_frame->GetTCB().cast<double>();
+            Eigen::Matrix2d info = Eigen::Matrix2d::Identity() / (m_pixel_noise_std * m_pixel_noise_std);
+            
+            Eigen::Vector2d obs_pixel(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
+            
+            auto* cost = new factor::BAFactor(obs_pixel, cam_params, T_cb, info);
+            factors.push_back(cost);
+            factor_indices.push_back({fi, pi});
+            
+            problem.AddResidualBlock(
+                cost,
+                new ceres::HuberLoss(m_huber_delta),
+                pose_params[fi].data(),
+                point_params[pi].data()
+            );
+        }
+    }
+    
+    // Track which pose parameter blocks were actually added to the problem
+    std::set<size_t> poses_in_problem;
+    for (const auto& [fi, pi] : factor_indices) {
+        poses_in_problem.insert(fi);
+    }
+    
+    // Fix poses:
+    // 1. First frame in window is always fixed (gauge freedom)
+    // 2. All frames outside window are fixed
+    
+    // Find first window frame index and fix it
+    for (size_t i = 0; i < all_frames.size(); ++i) {
+        if (all_frames[i] == window_frames.front()) {
+            if (poses_in_problem.count(i) > 0) {
+                problem.SetParameterBlockConstant(pose_params[i].data());
+            }
+            break;
+        }
+    }
+    
+    // Fix all out-of-window frames (only if they have residuals in the problem)
+    int fixed_count = 0;
+    for (const auto& fixed_frame : fixed_frames_set) {
+        auto it = frame_to_idx.find(fixed_frame);
+        if (it != frame_to_idx.end() && poses_in_problem.count(it->second) > 0) {
+            problem.SetParameterBlockConstant(pose_params[it->second].data());
+            fixed_count++;
+        }
+    }
+    
+    LOG_INFO("  LocalBA: {} window frames, {} fixed frames, {} MapPoints, {} factors",
+             window_frames.size(), fixed_count, mappoints.size(), factors.size());
+    
+    // Solve
+    ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
+    options.linear_solver_type = ceres::SPARSE_SCHUR;
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+    
+    // Outlier detection and MapPoint quality assessment
+    int num_inliers = 0;
+    int num_outliers = 0;
+    
+    std::map<size_t, int> mp_inlier_count;
+    std::map<size_t, int> mp_outlier_count;
+    
+    for (size_t i = 0; i < factors.size(); ++i) {
+        auto [fi, pi] = factor_indices[i];
+        const double* params[2] = {pose_params[fi].data(), point_params[pi].data()};
+        double chi2 = factors[i]->compute_chi_square(params);
+        if (chi2 > m_chi2_threshold) {
+            num_outliers++;
+            mp_outlier_count[pi]++;
+        } else {
+            num_inliers++;
+            mp_inlier_count[pi]++;
+        }
+    }
+    
+    // Mark MapPoints as bad only if ALWAYS outlier (never inlier in any observation)
+    // This is much more conservative - only remove truly bad points
+    int bad_mp_count = 0;
+    for (size_t i = 0; i < mappoints.size(); ++i) {
+        int inliers = mp_inlier_count[i];
+        int outliers = mp_outlier_count[i];
+        int total = inliers + outliers;
+        
+        // Only mark as bad if:
+        // 1. Has observations but ZERO inliers (all outliers), AND
+        // 2. Has at least 2 outlier observations (need enough evidence)
+        if (total >= 2 && inliers == 0) {
+            mappoints[i]->SetBad(true);
+            bad_mp_count++;
+        }
+    }
+    
+    if (bad_mp_count > 0) {
+        LOG_INFO("  Marked {} MapPoints as bad (zero inliers)", bad_mp_count);
+    }
+    
+    // Update ONLY window frames poses (not fixed frames)
+    for (size_t i = 0; i < all_frames.size(); ++i) {
+        // Skip if this frame is in the fixed set
+        if (fixed_frames_set.find(all_frames[i]) != fixed_frames_set.end()) continue;
+        // Skip if this is the first window frame (also fixed)
+        if (all_frames[i] == window_frames.front()) continue;
+        
+        all_frames[i]->SetTwb(ParamsToPose(pose_params[i].data()));
+    }
+    
+    // Update MapPoints
+    for (size_t i = 0; i < mappoints.size(); ++i) {
+        if (!mappoints[i]->IsBad()) {
+            Eigen::Vector3f pos(point_params[i][0], point_params[i][1], point_params[i][2]);
+            mappoints[i]->SetPosition(pos);
+        }
+    }
+    
+    result.success = summary.IsSolutionUsable();
+    result.num_inliers = num_inliers;
+    result.num_outliers = num_outliers;
+    result.num_poses_optimized = window_frames.size() - 1 + fixed_count;  // -1 for fixed first frame
+    result.num_points_optimized = mappoints.size();
+    result.initial_cost = summary.initial_cost;
+    result.final_cost = summary.final_cost;
+    result.num_iterations = summary.iterations.size();
+    
+    return result;
 }
 
 } // namespace vio_360

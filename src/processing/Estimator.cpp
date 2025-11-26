@@ -66,6 +66,8 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
     // Create new frame
     m_current_frame = CreateFrame(image, timestamp);
     
+    LOG_INFO("ProcessFrame {}: m_initialized={}", m_current_frame->GetFrameId(), m_initialized);
+    
     if (!m_initialized) {
         // Not initialized yet - accumulate frames for initialization
         if (m_previous_frame) {
@@ -84,14 +86,20 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             m_frame_window.erase(m_frame_window.begin());
         }
         
+        LOG_INFO("  Window size: {}/{}, trying init...", m_frame_window.size(), m_window_size);
+        
         // Try to initialize when window is full
         if (static_cast<int>(m_frame_window.size()) == m_window_size) {
             bool init_result = TryInitialize();
+            
+            LOG_INFO("  TryInitialize returned: {}", init_result);
             
             if (init_result) {
                 // Initialization succeeded!
                 result.init_success = true;
                 m_initialized = true;
+                
+                LOG_INFO("  >>> INITIALIZATION SUCCESS! m_initialized set to true <<<");
                 
                 // Set initialization keyframes
                 auto first_frame = m_frame_window.front();
@@ -116,8 +124,7 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
                     
                     if (parallax >= m_min_parallax) {
                         result.init_ready = true;
-                        // Pause even on failure for debugging
-                        result.init_success = true;  // Trigger pause for debugging
+                        // Note: Don't set init_success here - only on actual success
                     }
                 }
             }
@@ -244,14 +251,20 @@ Estimator::EstimationResult Estimator::ProcessFrame(
                 
                 m_keyframes.push_back(first_frame);
                 m_keyframes.push_back(last_frame);
+                m_all_keyframes.push_back(first_frame);
+                m_all_keyframes.push_back(last_frame);
                 m_last_keyframe = last_frame;
                 
                 LOG_INFO("Set keyframes: {} and {} (last_keyframe={})", 
                          first_frame->GetFrameId(), last_frame->GetFrameId(), 
                          m_last_keyframe->GetFrameId());
                 
-                // Process intermediate frames: interpolate poses, link MapPoints, run PnP
-                ProcessIntermediateFrames();
+                // Note: We only use the first and last frames as keyframes from initialization.
+                // Intermediate frames are not added as keyframes (they don't have triangulated points).
+                // The sliding window will naturally grow as new keyframes are created.
+                
+                // OLD: Process intermediate frames: interpolate poses, link MapPoints, run PnP
+                // ProcessIntermediateFrames();  // Commented out - not useful for now
             } else {
                 if (m_frame_window.size() >= 2) {
                     auto first_frame = m_frame_window.front();
@@ -373,6 +386,7 @@ void Estimator::ProcessIMU(const std::vector<IMUData>& imu_data) {
 
 bool Estimator::TryInitialize() {
     if (m_frame_window.size() < 2) {
+        LOG_INFO("[Init] Window size {} < 2, skip", m_frame_window.size());
         return false;
     }
     
@@ -383,26 +397,37 @@ bool Estimator::TryInitialize() {
     // Compute parallax between first and last frames
     float parallax = m_initializer->ComputeParallax(first_frame, last_frame);
     
+    LOG_INFO("[Init] Frame {}->{}: parallax={:.2f}px (min={:.2f})", 
+             first_frame->GetFrameId(), last_frame->GetFrameId(), 
+             parallax, m_min_parallax);
+    
     // Check if parallax is sufficient
     if (parallax < m_min_parallax) {
-        // Insufficient parallax - silently continue
+        LOG_INFO("[Init] Insufficient parallax, waiting...");
         return false;
     }
     
     // Step 1: Select features with sufficient observations
     auto selected_features = m_initializer->SelectFeaturesForInit(m_frame_window);
     
+    LOG_INFO("[Init] Selected {} features for initialization", selected_features.size());
+    
     if (selected_features.empty()) {
+        LOG_WARN("[Init] No features selected, skip");
         return false;
     }
     
     // Step 2: Try monocular initialization
+    LOG_INFO("[Init] Attempting monocular initialization...");
     InitializationResult init_result;
     bool init_success = m_initializer->TryMonocularInitialization(m_frame_window, init_result);
     
     if (!init_success) {
+        LOG_WARN("[Init] Monocular initialization failed");
         return false;
     }
+    
+    LOG_INFO("[Init] Monocular init SUCCESS: {} MapPoints created", init_result.initialized_mappoints.size());
     
     // Step 3: Store initialization results
     m_initialized_points = init_result.points3d;
@@ -517,6 +542,7 @@ void Estimator::CreateKeyframe() {
     // Mark current frame as keyframe
     m_current_frame->SetKeyframe(true);
     m_keyframes.push_back(m_current_frame);
+    m_all_keyframes.push_back(m_current_frame);  // Also add to all keyframes list
     m_last_keyframe = m_current_frame;
     
     // Maintain keyframe window size (remove oldest keyframes from front)
@@ -535,7 +561,7 @@ void Estimator::CreateKeyframe() {
     if (new_points > 0 && m_keyframes.size() >= 2) {
         LOG_INFO("Running local BA with {} keyframes...", m_keyframes.size());
         Optimizer optimizer;
-        BAResult ba_result = optimizer.RunBA(m_keyframes, true, false);  // Fix first pose only
+        BAResult ba_result = optimizer.RunLocalBA(m_keyframes);  // Sliding window BA
         LOG_INFO("Local BA done: {} inliers, {} outliers", 
                  ba_result.num_inliers, ba_result.num_outliers);
     }
@@ -735,6 +761,13 @@ float Estimator::ComputeParallax(
     }
 }
 
+bool Estimator::IsKeyframeInWindow(int frame_id) const {
+    for (const auto& kf : m_keyframes) {
+        if (kf->GetFrameId() == frame_id) return true;
+    }
+    return false;
+}
+
 bool Estimator::TriangulateSinglePoint(
     const Eigen::Vector3f& bearing1,
     const Eigen::Vector3f& bearing2,
@@ -742,80 +775,59 @@ bool Estimator::TriangulateSinglePoint(
     const Eigen::Matrix4f& T2w,
     Eigen::Vector3f& point3d
 ) const {
-    // Get camera centers in world frame
-    // T_cw means world to camera, so camera center = -R^T * t
-    Eigen::Matrix3f R1 = T1w.block<3, 3>(0, 0);
-    Eigen::Vector3f t1 = T1w.block<3, 1>(0, 3);
-    Eigen::Vector3f C1 = -R1.transpose() * t1;  // Camera 1 center in world
+    // Stella VSLAM style triangulation using SVD
+    // Reference: stella_vslam/solve/triangulator.h
     
-    Eigen::Matrix3f R2 = T2w.block<3, 3>(0, 0);
-    Eigen::Vector3f t2 = T2w.block<3, 1>(0, 3);
-    Eigen::Vector3f C2 = -R2.transpose() * t2;  // Camera 2 center in world
+    // Build 4x4 matrix A for SVD triangulation
+    // A.row(0) = bearing_1(0) * cam_pose_1.row(2) - bearing_1(2) * cam_pose_1.row(0);
+    // A.row(1) = bearing_1(1) * cam_pose_1.row(2) - bearing_1(2) * cam_pose_1.row(1);
+    // A.row(2) = bearing_2(0) * cam_pose_2.row(2) - bearing_2(2) * cam_pose_2.row(0);
+    // A.row(3) = bearing_2(1) * cam_pose_2.row(2) - bearing_2(2) * cam_pose_2.row(1);
     
-    // Transform bearing vectors to world frame
-    Eigen::Vector3f d1 = R1.transpose() * bearing1;  // Ray direction in world
-    Eigen::Vector3f d2 = R2.transpose() * bearing2;
+    Eigen::Matrix4f A;
+    A.row(0) = bearing1(0) * T1w.row(2) - bearing1(2) * T1w.row(0);
+    A.row(1) = bearing1(1) * T1w.row(2) - bearing1(2) * T1w.row(1);
+    A.row(2) = bearing2(0) * T2w.row(2) - bearing2(2) * T2w.row(0);
+    A.row(3) = bearing2(1) * T2w.row(2) - bearing2(2) * T2w.row(1);
     
-    d1.normalize();
-    d2.normalize();
+    // SVD decomposition
+    Eigen::JacobiSVD<Eigen::Matrix4f> svd(A, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Vector4f singular_vector = svd.matrixV().col(3);
     
-    // Solve for closest point between two rays using mid-point method
-    // Ray1: P = C1 + λ1 * d1
-    // Ray2: P = C2 + λ2 * d2
-    
-    Eigen::Vector3f w0 = C1 - C2;
-    float a = d1.dot(d1);
-    float b = d1.dot(d2);
-    float c = d2.dot(d2);
-    float d = d1.dot(w0);
-    float e = d2.dot(w0);
-    
-    float denom = a * c - b * b;
-    if (std::abs(denom) < 1e-8f) {
-        LOG_WARN("  Tri fail: rays parallel, denom={:.2e}", denom);
-        return false;  // Rays are parallel
-    }
-    
-    float lambda1 = (b * e - c * d) / denom;
-    float lambda2 = (a * e - b * d) / denom;
-    
-    // Check positive depth
-    if (lambda1 < 0.01f || lambda2 < 0.01f) {
-        LOG_WARN("  Tri fail: negative depth, lambda1={:.4f}, lambda2={:.4f}", lambda1, lambda2);
+    // Check for valid homogeneous coordinate
+    if (std::abs(singular_vector(3)) < 1e-10f) {
         return false;
     }
     
-    // Compute points on each ray
-    Eigen::Vector3f P1 = C1 + lambda1 * d1;
-    Eigen::Vector3f P2 = C2 + lambda2 * d2;
+    // Convert to 3D point
+    point3d = singular_vector.head<3>() / singular_vector(3);
     
-    // Mid-point
-    point3d = (P1 + P2) / 2.0f;
+    // Check depth is positive in both cameras (Stella VSLAM style)
+    // Transform point to camera coordinates and check z > 0
+    Eigen::Vector4f point_h(point3d.x(), point3d.y(), point3d.z(), 1.0f);
     
-    // Check reprojection (optional, for quality)
-    // For small baseline, allow larger ratio since measurement noise dominates
-    float dist = (P1 - P2).norm();
-    float baseline = (C1 - C2).norm();
+    Eigen::Vector4f pc1 = T1w * point_h;
+    Eigen::Vector4f pc2 = T2w * point_h;
     
-    // Use absolute distance threshold instead of ratio for small baselines
-    // Also check that the point is not too far (depth sanity check)
-    float max_depth = 50.0f;  // Maximum depth in meters
-    float depth1 = lambda1;
-    float depth2 = lambda2;
+    // For equirectangular, check that the point is in the direction of the bearing
+    // (dot product should be positive)
+    float dot1 = pc1.head<3>().normalized().dot(bearing1);
+    float dot2 = pc2.head<3>().normalized().dot(bearing2);
     
-    if (depth1 > max_depth || depth2 > max_depth) {
-        LOG_WARN("  Tri fail: depth too large, d1={:.2f}, d2={:.2f}", depth1, depth2);
-        return false;
+    if (dot1 <= 0.0f || dot2 <= 0.0f) {
+        return false;  // Point behind camera
     }
     
-    // For intersection quality, use absolute threshold or relaxed ratio
-    float abs_threshold = 0.1f;  // 10cm absolute threshold
-    float ratio_threshold = 1.0f;  // 100% of baseline
+    // Check reasonable depth range
+    float depth1 = pc1.head<3>().norm();
+    float depth2 = pc2.head<3>().norm();
     
-    if (dist > abs_threshold && dist > ratio_threshold * baseline) {
-        LOG_WARN("  Tri fail: bad intersection, dist={:.4f}, baseline={:.4f}, ratio={:.2f}", 
-                 dist, baseline, dist/baseline);
-        return false;  // Rays don't intersect well
+    constexpr float kMinDepth = 0.1f;
+    constexpr float kMaxDepth = 100.0f;
+    
+    if (depth1 < kMinDepth || depth1 > kMaxDepth ||
+        depth2 < kMinDepth || depth2 > kMaxDepth) {
+        return false;
     }
     
     return true;
@@ -865,7 +877,12 @@ int Estimator::TriangulateNewMapPoints(
     int triangulated_count = 0;
     int matched_count = 0;
     int already_has_mp = 0;
-    int triangulation_failed = 0;
+    int depth_failed = 0;
+    int reproj_failed = 0;
+    int parallax_failed = 0;
+    
+    // Stella VSLAM: cos_rays_parallax_thr = cos(1 degree)
+    const float cos_rays_parallax_thr = 0.9998f;
     
     for (size_t i2 = 0; i2 < features2.size(); ++i2) {
         // Skip invalid features (outliers)
@@ -896,7 +913,36 @@ int Estimator::TriangulateNewMapPoints(
         // Triangulate
         Eigen::Vector3f point3d;
         if (!TriangulateSinglePoint(bearing1, bearing2, T1w, T2w, point3d)) {
-            triangulation_failed++;
+            depth_failed++;
+            continue;
+        }
+        
+        // Verify reprojection error before accepting the point
+        // Transform point to both camera frames and check error
+        Eigen::Vector4f point3d_h(point3d.x(), point3d.y(), point3d.z(), 1.0f);
+        
+        // Camera 1 reprojection
+        Eigen::Vector4f pc1_h = T1w * point3d_h;
+        Eigen::Vector3f pc1 = pc1_h.head<3>();
+        Eigen::Vector3f reproj_bearing1 = pc1.normalized();
+        float dot1 = bearing1.dot(reproj_bearing1);
+        float angle_error1 = std::acos(std::min(1.0f, std::abs(dot1)));
+        float pixel_error1 = angle_error1 * kf1->GetWidth() / (2.0f * M_PI);
+        
+        // Camera 2 reprojection
+        Eigen::Vector4f pc2_h = T2w * point3d_h;
+        Eigen::Vector3f pc2 = pc2_h.head<3>();
+        Eigen::Vector3f reproj_bearing2 = pc2.normalized();
+        float dot2 = bearing2.dot(reproj_bearing2);
+        float angle_error2 = std::acos(std::min(1.0f, std::abs(dot2)));
+        float pixel_error2 = angle_error2 * kf2->GetWidth() / (2.0f * M_PI);
+        
+        // Reject if reprojection error is too large
+        // Stella VSLAM uses chi-squared: chi_sq_2D * sigma_sq = 5.99 * 1.0 ≈ 2.5 px
+        // For equirectangular with more noise, use relaxed threshold
+        const float max_reproj_error = 5.0f;
+        if (pixel_error1 > max_reproj_error || pixel_error2 > max_reproj_error) {
+            reproj_failed++;
             continue;
         }
         
@@ -915,8 +961,8 @@ int Estimator::TriangulateNewMapPoints(
         triangulated_count++;
     }
     
-    LOG_INFO("  Matched: {}, already_has_mp: {}, tri_failed: {}, success: {}",
-             matched_count, already_has_mp, triangulation_failed, triangulated_count);
+    LOG_INFO("  Matched: {}, already_has_mp: {}, depth_fail: {}, reproj_fail: {}, success: {}",
+             matched_count, already_has_mp, depth_failed, reproj_failed, triangulated_count);
     
     return triangulated_count;
 }
