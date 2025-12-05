@@ -15,6 +15,7 @@
 #include "database/Frame.h"
 #include "database/MapPoint.h"
 #include "database/Feature.h"
+#include "database/Camera.h"
 #include "util/Logger.h"
 #include "util/LieUtils.h"
 
@@ -26,7 +27,21 @@ Optimizer::Optimizer()
     : m_huber_delta(1.0)
     , m_pixel_noise_std(1.0)
     , m_max_iterations(50)
-    , m_chi2_threshold(9.21) {  // Chi-square 99% for 2 DOF (more permissive)
+    , m_chi2_threshold(9.21)    // Chi-square 99% for 2 DOF (more permissive)
+    , m_camera(nullptr)
+    , m_boundary_margin(20) {
+}
+
+void Optimizer::SetCamera(std::shared_ptr<Camera> camera, int boundary_margin) {
+    m_camera = camera;
+    m_boundary_margin = boundary_margin;
+}
+
+bool Optimizer::IsNearBoundary(const cv::Point2f& pixel) const {
+    if (!m_camera || m_boundary_margin <= 0) {
+        return false;
+    }
+    return m_camera->IsNearBoundary(pixel, static_cast<float>(m_boundary_margin));
 }
 
 void Optimizer::PoseToParams(const Eigen::Matrix4f& pose, double* params) {
@@ -87,19 +102,41 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         return result;
     }
     
-    // Collect observations with valid MapPoints
+    // Collect observations with valid MapPoints, excluding boundary features
     std::vector<std::tuple<cv::Point2f, std::shared_ptr<MapPoint>, size_t>> observations;
+    
+    int total_features = 0;
+    int invalid_features = 0;
+    int no_mappoint = 0;
+    int boundary_filtered = 0;
     
     const auto& features = frame->GetFeatures();
     for (size_t i = 0; i < features.size(); ++i) {
         const auto& feature = features[i];
-        if (!feature || !feature->IsValid()) continue;
+        total_features++;
+        
+        if (!feature || !feature->IsValid()) {
+            invalid_features++;
+            continue;
+        }
         
         auto mp = frame->GetMapPoint(static_cast<int>(i));
-        if (!mp || mp->IsBad()) continue;
+        if (!mp || mp->IsBad()) {
+            no_mappoint++;
+            continue;
+        }
+        
+        // Skip features near horizontal boundary (ERP wrap-around issue)
+        if (IsNearBoundary(feature->GetPixelCoord())) {
+            boundary_filtered++;
+            continue;
+        }
         
         observations.push_back({feature->GetPixelCoord(), mp, i});
     }
+    
+    LOG_DEBUG("  PnP stats: total={}, invalid={}, no_mp={}, boundary={}, valid={}",
+              total_features, invalid_features, no_mappoint, boundary_filtered, observations.size());
     
     if (observations.size() < 6) {
         LOG_WARN("SolvePnP: insufficient observations ({})", observations.size());
@@ -203,11 +240,43 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         if (num_inliers > 0) {
             final_cost = inlier_reproj_sum / num_inliers;
         }
+        
+        // Debug log for each round
+        LOG_DEBUG("  PnP round {}: inliers={}, outliers={}, cost={:.2f}", 
+                  round, num_inliers, num_outliers, final_cost);
     }
     
     // Update frame pose with final optimized value
     result.optimized_pose = ParamsToPose(pose_params);
-    frame->SetTwb(result.optimized_pose);
+    
+    // Log pose change for debugging
+    Eigen::Matrix4f old_pose = frame->GetTwb();
+    Eigen::Vector3f old_pos = old_pose.block<3,1>(0,3);
+    Eigen::Vector3f new_pos = result.optimized_pose.block<3,1>(0,3);
+    float pos_change = (new_pos - old_pos).norm();
+    
+    // Safety check: reject if too few inliers or too large pose change
+    const int min_inliers_for_update = 10;
+    const float max_pose_change = 0.5f;  // 0.5m threshold
+    
+    if (result.num_inliers < min_inliers_for_update) {
+        LOG_WARN("  PnP rejected: too few inliers ({} < {}), keeping predicted pose",
+                 result.num_inliers, min_inliers_for_update);
+        result.success = false;
+        result.optimized_pose = old_pose;  // Keep old pose
+    } else if (pos_change > max_pose_change && result.num_inliers < 50) {
+        LOG_WARN("  PnP rejected: large pose change {:.3f}m with only {} inliers, keeping predicted pose",
+                 pos_change, result.num_inliers);
+        result.success = false;
+        result.optimized_pose = old_pose;  // Keep old pose
+    } else {
+        if (pos_change > 0.3f) {
+            LOG_WARN("  PnP large pose change: {:.3f}m, old=({:.2f},{:.2f},{:.2f}), new=({:.2f},{:.2f},{:.2f})",
+                     pos_change, old_pos.x(), old_pos.y(), old_pos.z(),
+                     new_pos.x(), new_pos.y(), new_pos.z());
+        }
+        frame->SetTwb(result.optimized_pose);
+    }
     
     result.initial_cost = initial_cost;
     result.final_cost = final_cost;  // Now this is mean inlier reprojection error in pixels
@@ -287,6 +356,9 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
             
             auto mp = frame->GetMapPoint(static_cast<int>(i));
             if (!mp || mp->IsBad()) continue;
+            
+            // Skip features near horizontal boundary (ERP wrap-around issue)
+            if (IsNearBoundary(feature->GetPixelCoord())) continue;
             
             auto it = mp_to_idx.find(mp);
             if (it == mp_to_idx.end()) continue;
@@ -478,6 +550,9 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
             
             const auto& feature = features[obs.feature_index];
             if (!feature || !feature->IsValid()) continue;
+            
+            // Skip features near horizontal boundary (ERP wrap-around issue)
+            if (IsNearBoundary(feature->GetPixelCoord())) continue;
             
             // Camera parameters
             double cols = static_cast<double>(obs_frame->GetWidth());

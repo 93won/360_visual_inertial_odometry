@@ -36,13 +36,15 @@ Estimator::Estimator()
         config.camera_width,
         config.camera_height
     );
+    m_boundary_margin = config.camera_boundary_margin;
     
     // Initialize feature tracker
     m_feature_tracker = std::make_unique<FeatureTracker>(
         m_camera,
         config.max_features,
         config.min_distance,
-        config.quality_level
+        config.quality_level,
+        config.camera_boundary_margin
     );
     
     // Initialize monocular initializer
@@ -156,6 +158,7 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
         if (valid_mp_count >= 6) {
             // Run PnP optimization
             Optimizer optimizer;
+            optimizer.SetCamera(m_camera, m_boundary_margin);
             PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
             
             // Compute parallax from last keyframe
@@ -309,7 +312,9 @@ Estimator::EstimationResult Estimator::ProcessFrame(
         // Pose estimation using PnP
         if (valid_mp_count >= 6) {
             // Run PnP optimization
+            const auto& config = ConfigUtils::GetInstance();
             Optimizer optimizer;
+            optimizer.SetCamera(m_camera, m_boundary_margin);
             PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
             
             // Compute parallax from last keyframe
@@ -590,6 +595,24 @@ void Estimator::CreateKeyframe() {
     while (static_cast<int>(m_keyframes.size()) > max_keyframes) {
         auto oldest_keyframe = m_keyframes.front();
         
+        // Fix MapPoints whose reference keyframe is being removed
+        // This preserves scale by locking points that originated from this keyframe
+        const auto& old_kf_features = oldest_keyframe->GetFeatures();
+        int fixed_count = 0;
+        for (size_t i = 0; i < old_kf_features.size(); ++i) {
+            auto mp = oldest_keyframe->GetMapPoint(static_cast<int>(i));
+            if (mp && !mp->IsBad() && !mp->IsFixed()) {
+                // Check if this keyframe is the reference (origin) for this MapPoint
+                if (mp->IsReferenceKeyframe(oldest_keyframe)) {
+                    mp->SetFixed(true);
+                    fixed_count++;
+                }
+            }
+        }
+        if (fixed_count > 0) {
+            LOG_INFO("  Fixed {} MapPoints from removed keyframe {}", fixed_count, oldest_keyframe->GetFrameId());
+        }
+        
         // Clean up observations from MapPoints before removing the keyframe
         const auto& features = oldest_keyframe->GetFeatures();
         for (size_t i = 0; i < features.size(); ++i) {
@@ -616,6 +639,7 @@ void Estimator::CreateKeyframe() {
     if (new_points > 0 && m_keyframes.size() >= 2) {
         LOG_INFO("Running local BA with {} keyframes...", m_keyframes.size());
         Optimizer optimizer;
+        optimizer.SetCamera(m_camera, m_boundary_margin);
         BAResult ba_result = optimizer.RunLocalBA(m_keyframes);  // Sliding window BA
         LOG_INFO("Local BA done: {} inliers, {} outliers", 
                  ba_result.num_inliers, ba_result.num_outliers);
@@ -744,6 +768,7 @@ void Estimator::ProcessIntermediateFrames() {
         // Run PnP to refine pose
         if (linked >= 6) {
             Optimizer optimizer;
+            optimizer.SetCamera(m_camera, m_boundary_margin);
             PnPResult pnp_result = optimizer.SolvePnP(frame);
             LOG_INFO("  Frame {}: interpolated -> PnP {} in/{} out, reproj {:.2f}px",
                      frame->GetFrameId(), pnp_result.num_inliers, pnp_result.num_outliers,
@@ -754,6 +779,7 @@ void Estimator::ProcessIntermediateFrames() {
     // Run BA on all frames in window
     LOG_INFO("Running BA on {} frames in initialization window...", n_frames);
     Optimizer optimizer;
+    optimizer.SetCamera(m_camera, m_boundary_margin);
     BAResult ba_result = optimizer.RunBA(m_frame_window, true, false);
     LOG_INFO("Init window BA done: {} inliers, {} outliers", 
              ba_result.num_inliers, ba_result.num_outliers);
@@ -874,20 +900,20 @@ bool Estimator::TriangulateSinglePoint(
         return false;
     }
     
-    // Check reasonable depth range (distance from cameras)
-    Eigen::Vector3f cam1_center = -T1w.block<3,3>(0,0).transpose() * T1w.block<3,1>(0,3);
-    Eigen::Vector3f cam2_center = -T2w.block<3,3>(0,0).transpose() * T2w.block<3,1>(0,3);
+    // // Check reasonable depth range (distance from cameras)
+    // Eigen::Vector3f cam1_center = -T1w.block<3,3>(0,0).transpose() * T1w.block<3,1>(0,3);
+    // Eigen::Vector3f cam2_center = -T2w.block<3,3>(0,0).transpose() * T2w.block<3,1>(0,3);
     
-    float depth1 = (point3d - cam1_center).norm();
-    float depth2 = (point3d - cam2_center).norm();
+    // float depth1 = (point3d - cam1_center).norm();
+    // float depth2 = (point3d - cam2_center).norm();
     
-    constexpr float kMinDepth = 0.1f;
-    constexpr float kMaxDepth = 100.0f;
+    // constexpr float kMinDepth = 0.1f;
+    // constexpr float kMaxDepth = 100.0f;
     
-    if (depth1 < kMinDepth || depth1 > kMaxDepth ||
-        depth2 < kMinDepth || depth2 > kMaxDepth) {
-        return false;
-    }
+    // if (depth1 < kMinDepth || depth1 > kMaxDepth ||
+    //     depth2 < kMinDepth || depth2 > kMaxDepth) {
+    //     return false;
+    // }
     
     return true;
 }
@@ -940,8 +966,6 @@ int Estimator::TriangulateNewMapPoints(
     int reproj_failed = 0;
     int parallax_failed = 0;
     
-    // Stella VSLAM: cos_rays_parallax_thr = cos(1 degree)
-    const float cos_rays_parallax_thr = 0.9998f;
     
     for (size_t i2 = 0; i2 < features2.size(); ++i2) {
         // Skip invalid features (outliers)
@@ -998,16 +1022,19 @@ int Estimator::TriangulateNewMapPoints(
         
         // Reject if reprojection error is too large
         // Stella VSLAM uses chi-squared: chi_sq_2D * sigma_sq = 5.99 * 1.0 ≈ 2.5 px
-        // For equirectangular with more noise, use relaxed threshold
-        const float max_reproj_error = 5.0f;
-        if (pixel_error1 > max_reproj_error || pixel_error2 > max_reproj_error) {
-            reproj_failed++;
-            continue;
-        }
+        // // For equirectangular with more noise, use relaxed threshold
+        // const float max_reproj_error = 5.0f;
+        // if (pixel_error1 > max_reproj_error || pixel_error2 > max_reproj_error) {
+        //     reproj_failed++;
+        //     continue;
+        // }
         
         // Create new MapPoint
         auto mp = std::make_shared<MapPoint>(point3d);
         mp->SetTriangulated(true);
+        
+        // Set the earlier keyframe (kf1) as the reference keyframe for scale consistency
+        mp->SetReferenceKeyframe(kf1);
         
         // Add observations to MapPoint
         mp->AddObservation(kf1, i1);
@@ -1039,6 +1066,7 @@ int Estimator::TriangulateNewMapPoints(
             // Verify the observation is valid (check reprojection error)
             const auto& obs_features = obs_frame->GetFeatures();
             if (obs_feat_idx < 0 || obs_feat_idx >= static_cast<int>(obs_features.size())) {
+                spdlog::error("Invalid feature index {} in frame {}", obs_feat_idx, obs_frame->GetFrameId());
                 continue;
             }
             
@@ -1053,7 +1081,8 @@ int Estimator::TriangulateNewMapPoints(
             float pixel_error = angle_error * obs_frame->GetWidth() / (2.0f * M_PI);
             
             // Only add if reprojection error is acceptable
-            if (pixel_error <= max_reproj_error) {
+            // if (pixel_error <= max_reproj_error) 
+            {
                 mp->AddObservation(obs_frame, obs_feat_idx);
                 obs_frame->SetMapPoint(obs_feat_idx, mp);
             }

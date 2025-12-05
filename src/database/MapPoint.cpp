@@ -191,4 +191,10 @@ float MapPoint::ComputeReprojectionError(std::shared_ptr<Frame> frame) const {
     return std::sqrt(du * du + dv * dv);
 }
 
+bool MapPoint::IsReferenceKeyframe(std::shared_ptr<Frame> frame) const {
+    if (!frame) return false;
+    auto ref_kf = m_reference_keyframe.lock();
+    return ref_kf && ref_kf == frame;
+}
+
 } // namespace vio_360

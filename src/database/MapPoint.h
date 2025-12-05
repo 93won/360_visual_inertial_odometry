@@ -110,6 +110,24 @@ public:
     void SetFixed(bool fixed = true) { m_is_fixed = fixed; }
     bool IsFixed() const { return m_is_fixed; }
     
+    // ============ Reference Keyframe Management ============
+    
+    /**
+     * @brief Set the reference (origin) keyframe for this MapPoint
+     * The reference keyframe is the first keyframe that observed this point
+     */
+    void SetReferenceKeyframe(std::shared_ptr<Frame> frame) { m_reference_keyframe = frame; }
+    
+    /**
+     * @brief Get the reference (origin) keyframe
+     */
+    std::shared_ptr<Frame> GetReferenceKeyframe() const { return m_reference_keyframe.lock(); }
+    
+    /**
+     * @brief Check if given frame is the reference keyframe
+     */
+    bool IsReferenceKeyframe(std::shared_ptr<Frame> frame) const;
+    
     // ============ Depth Management ============
     
     /**
@@ -134,6 +152,8 @@ private:
     bool m_is_bad;                               ///< Bad flag (invalid point)
     bool m_is_triangulated;                      ///< Successfully triangulated
     bool m_is_fixed;                             ///< Fixed flag (do not optimize in BA)
+    
+    std::weak_ptr<Frame> m_reference_keyframe;   ///< First keyframe that observed this point (origin)
     
     mutable std::mutex m_mutex;                  ///< Thread safety
     

@@ -39,7 +39,8 @@ public:
     FeatureTracker(std::shared_ptr<Camera> camera,
                    int max_features = 500,
                    float min_distance = 30.0f,
-                   float quality_level = 0.01f);
+                   float quality_level = 0.01f,
+                   int boundary_margin = 20);
     
     ~FeatureTracker() = default;
 
@@ -186,6 +187,9 @@ private:
     int m_grid_rows;                         // Number of grid rows
     int m_max_features_per_grid;             // Max features per grid cell
     
+    // Boundary margin for ERP wrap-around
+    int m_boundary_margin;                   // Margin from horizontal boundary
+    
     // Tracking state
     cv::Mat m_prev_image;                    // Previous image
     std::vector<std::shared_ptr<Feature>> m_prev_features;  // Previous features
@@ -197,6 +201,7 @@ private:
     
     // Mask
     cv::Mat m_polar_mask;                    // Polar region mask
+    cv::Mat m_boundary_mask;                 // Boundary exclusion mask (ERP wrap-around)
 };
 
 } // namespace vio_360

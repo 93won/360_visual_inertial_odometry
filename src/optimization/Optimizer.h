@@ -16,12 +16,14 @@
 #include <vector>
 #include <Eigen/Dense>
 #include <ceres/ceres.h>
+#include <opencv2/core.hpp>
 
 namespace vio_360 {
 
 // Forward declarations
 class Frame;
 class MapPoint;
+class Camera;
 
 /**
  * @brief PnP optimization result
@@ -72,6 +74,13 @@ public:
      * @brief Destructor
      */
     ~Optimizer() = default;
+    
+    /**
+     * @brief Set camera for boundary checking
+     * @param camera Camera pointer
+     * @param boundary_margin Boundary margin in pixels
+     */
+    void SetCamera(std::shared_ptr<Camera> camera, int boundary_margin = 20);
     
     /**
      * @brief Solve PnP for a single frame using observed MapPoints
@@ -130,11 +139,20 @@ private:
      */
     ceres::Solver::Options SetupSolverOptions(int max_iterations = 50);
     
+    /**
+     * @brief Check if a feature is near horizontal boundary
+     */
+    bool IsNearBoundary(const cv::Point2f& pixel) const;
+    
     // Parameters
     double m_huber_delta;         // Huber loss delta
     double m_pixel_noise_std;     // Pixel noise standard deviation
     int m_max_iterations;         // Maximum iterations
     double m_chi2_threshold;      // Chi-square threshold for outlier detection
+    
+    // Camera for boundary checking
+    std::shared_ptr<Camera> m_camera;
+    int m_boundary_margin;        // Boundary margin in pixels
 };
 
 } // namespace vio_360

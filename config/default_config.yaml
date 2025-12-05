@@ -8,15 +8,15 @@ camera:
   boundary_margin: 20
 
 feature_detection:
-  max_features: 2000
+  max_features: 1000
   quality_level: 0.01
-  min_distance: 20.0
+  min_distance: 30.0
   grid_cols: 20
   grid_rows: 10
-  max_features_per_grid: 4
+  max_features_per_grid: 10
 
 optical_flow:
-  window_size: 21
+  window_size: 51
   max_level: 3
   max_iterations: 30
   epsilon: 0.01
@@ -28,7 +28,7 @@ ransac:
 
 tracking:
   min_features_ratio: 0.5
-  min_parallax_for_keyframe: 5.0  # Minimum parallax (pixels) to create new keyframe
+  min_parallax_for_keyframe: 10.0  # Minimum parallax (pixels) to create new keyframe
 
 initialization:
   window_size: 10

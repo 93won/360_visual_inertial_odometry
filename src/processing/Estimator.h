@@ -174,6 +174,7 @@ private:
     std::unique_ptr<Initializer> m_initializer;
     std::unique_ptr<IMUPreintegrator> m_imu_preintegrator;
     std::shared_ptr<Camera> m_camera;
+    int m_boundary_margin;
     
     // State
     std::shared_ptr<Frame> m_current_frame;

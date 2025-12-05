@@ -24,7 +24,8 @@ namespace vio_360 {
 FeatureTracker::FeatureTracker(std::shared_ptr<Camera> camera,
                                int max_features,
                                float min_distance,
-                               float quality_level)
+                               float quality_level,
+                               int boundary_margin)
     : m_camera(camera),
       m_max_features(max_features),
       m_min_distance(min_distance),
@@ -38,12 +39,23 @@ FeatureTracker::FeatureTracker(std::shared_ptr<Camera> camera,
       m_grid_cols(20),
       m_grid_rows(10),
       m_max_features_per_grid(4),
+      m_boundary_margin(boundary_margin),
       m_next_feature_id(0),
       m_num_tracked(0),
       m_num_detected(0) {
     
     // Create polar region mask
     m_polar_mask = m_camera->CreatePolarMask();
+    
+    // Create boundary exclusion mask (exclude left/right boundaries for ERP wrap-around)
+    m_boundary_mask = cv::Mat::ones(m_camera->GetHeight(), m_camera->GetWidth(), CV_8UC1) * 255;
+    if (m_boundary_margin > 0) {
+        // Left boundary (0 to margin)
+        m_boundary_mask(cv::Rect(0, 0, m_boundary_margin, m_camera->GetHeight())) = 0;
+        // Right boundary (width-margin to width)
+        m_boundary_mask(cv::Rect(m_camera->GetWidth() - m_boundary_margin, 0, 
+                                  m_boundary_margin, m_camera->GetHeight())) = 0;
+    }
 }
 
 void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
@@ -106,7 +118,7 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
     for (size_t i = 0; i < status.size(); ++i) {
         if (status[i] && 
             !m_camera->IsInPolarRegion(curr_points[i]) &&
-            !m_camera->IsNearBoundary(curr_points[i])) {
+            !m_camera->IsNearBoundary(curr_points[i], static_cast<float>(m_boundary_margin))) {
             good_prev_points.push_back(prev_points[i]);
             good_curr_points.push_back(curr_points[i]);
             good_prev_features.push_back(prev_features_vec[i]);
@@ -195,11 +207,15 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
 
 std::vector<cv::Point2f> FeatureTracker::DetectNewFeatures(const cv::Mat& image, 
                                                            const cv::Mat& mask) {
+    // Combine polar mask and boundary mask
+    cv::Mat base_mask;
+    cv::bitwise_and(m_polar_mask, m_boundary_mask, base_mask);
+    
     cv::Mat combined_mask;
     if (mask.empty()) {
-        combined_mask = m_polar_mask.clone();
+        combined_mask = base_mask.clone();
     } else {
-        cv::bitwise_and(m_polar_mask, mask, combined_mask);
+        cv::bitwise_and(base_mask, mask, combined_mask);
     }
     
     std::vector<cv::Point2f> corners;
