@@ -242,6 +242,35 @@ public:
      */
     Eigen::Matrix4f GetTCB() const { return m_T_CB; }
     
+    // ============ Reference Keyframe Management ============
+    
+    /**
+     * @brief Set reference keyframe and compute relative transform
+     * @param reference_kf Reference keyframe
+     * 
+     * For non-keyframes, this computes and stores the relative transformation
+     * from the reference keyframe to this frame: T_rel = T_ref^-1 * T_current
+     */
+    void SetReferenceKeyframe(std::shared_ptr<Frame> reference_kf);
+    
+    /**
+     * @brief Get reference keyframe
+     * @return Shared pointer to reference keyframe (may be null)
+     */
+    std::shared_ptr<Frame> GetReferenceKeyframe() const;
+    
+    /**
+     * @brief Get relative transform from reference keyframe
+     * @return T_rel such that T_current = T_ref * T_rel
+     */
+    const Eigen::Matrix4f& GetRelativeTransform() const { return m_T_relative_from_ref; }
+    
+    /**
+     * @brief Set relative transform from reference keyframe
+     * @param T_relative Relative transform
+     */
+    void SetRelativeTransform(const Eigen::Matrix4f& T_relative) { m_T_relative_from_ref = T_relative; }
+    
 private:
     // Frame information
     long long m_timestamp;         // Timestamp in nanoseconds
@@ -269,6 +298,10 @@ private:
     // Keyframe flag
     bool m_is_keyframe;
     double m_dt_from_last_keyframe; // Time since last keyframe [seconds]
+    
+    // Reference keyframe for non-keyframes (to compute pose relative to keyframe)
+    std::weak_ptr<Frame> m_reference_keyframe;  // Reference keyframe (weak_ptr to avoid cycles)
+    Eigen::Matrix4f m_T_relative_from_ref;      // Transform from reference keyframe to this frame
     
     // Camera extrinsics (body to camera transformation)
     Eigen::Matrix4f m_T_BC;        // Camera to body

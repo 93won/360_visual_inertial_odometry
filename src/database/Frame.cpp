@@ -29,6 +29,7 @@ Frame::Frame(long long timestamp, int frame_id, const cv::Mat& image, int width,
     , m_gyro_bias(Eigen::Vector3f::Zero())
     , m_is_keyframe(false)
     , m_dt_from_last_keyframe(0.0)
+    , m_T_relative_from_ref(Eigen::Matrix4f::Identity())
     , m_T_BC(Eigen::Matrix4f::Identity())
     , m_T_CB(Eigen::Matrix4f::Identity())
     , m_grid_cols(20)
@@ -43,11 +44,31 @@ Frame::Frame(long long timestamp, int frame_id, const cv::Mat& image, int width,
 Eigen::Matrix4f Frame::GetTwb() const {
     std::lock_guard<std::mutex> lock(m_pose_mutex);
     
-    Eigen::Matrix4f T_wb = Eigen::Matrix4f::Identity();
-    T_wb.block<3, 3>(0, 0) = m_rotation;
-    T_wb.block<3, 1>(0, 3) = m_translation;
+    // If this frame is a keyframe, return its direct pose
+    if (m_is_keyframe) {
+        Eigen::Matrix4f T_wb = Eigen::Matrix4f::Identity();
+        T_wb.block<3, 3>(0, 0) = m_rotation;
+        T_wb.block<3, 1>(0, 3) = m_translation;
+        return T_wb;
+    }
     
-    return T_wb;
+    // For non-keyframes, compute pose from reference keyframe
+    auto ref_kf = m_reference_keyframe.lock();
+    if (ref_kf) {
+        // Get reference keyframe pose (this may have been updated by BA)
+        Eigen::Matrix4f T_wb_ref = ref_kf->GetTwb();
+        
+        // Apply fixed relative transformation: T_wb = T_wb_ref * T_relative
+        Eigen::Matrix4f T_wb = T_wb_ref * m_T_relative_from_ref;
+        
+        return T_wb;
+    } else {
+        // Fallback to direct pose if no reference keyframe is available
+        Eigen::Matrix4f T_wb = Eigen::Matrix4f::Identity();
+        T_wb.block<3, 3>(0, 0) = m_rotation;
+        T_wb.block<3, 1>(0, 3) = m_translation;
+        return T_wb;
+    }
 }
 
 void Frame::SetTwb(const Eigen::Matrix4f& T_wb) {
@@ -254,6 +275,35 @@ int Frame::CountValidMapPoints() const {
         }
     }
     return count;
+}
+
+void Frame::SetReferenceKeyframe(std::shared_ptr<Frame> reference_kf) {
+    std::lock_guard<std::mutex> lock(m_pose_mutex);
+    m_reference_keyframe = reference_kf;
+    
+    // Calculate relative transformation at the time of setting reference keyframe
+    if (reference_kf) {
+        // Current frame pose (direct from m_rotation, m_translation)
+        Eigen::Matrix4f T_wb_current = Eigen::Matrix4f::Identity();
+        T_wb_current.block<3, 3>(0, 0) = m_rotation;
+        T_wb_current.block<3, 1>(0, 3) = m_translation;
+        
+        // Reference keyframe pose - need to unlock before calling GetTwb on another frame
+        // to avoid potential issues, we get pose components directly
+        Eigen::Matrix4f T_wb_ref = Eigen::Matrix4f::Identity();
+        T_wb_ref.block<3, 3>(0, 0) = reference_kf->GetRotation();
+        T_wb_ref.block<3, 1>(0, 3) = reference_kf->GetTranslation();
+        
+        // Calculate relative transformation: T_rel = T_ref^-1 * T_current
+        m_T_relative_from_ref = T_wb_ref.inverse() * T_wb_current;
+    } else {
+        // No reference keyframe, set to identity
+        m_T_relative_from_ref = Eigen::Matrix4f::Identity();
+    }
+}
+
+std::shared_ptr<Frame> Frame::GetReferenceKeyframe() const {
+    return m_reference_keyframe.lock();
 }
 
 } // namespace vio_360

@@ -98,6 +98,13 @@ public:
      */
     double compute_chi_square(double const* const* parameters) const;
 
+    /**
+     * @brief Compute bearing angle error for outlier detection (equirectangular)
+     * @param parameters SE3 pose parameters in tangent space [6]
+     * @return Angle error in radians between observed and projected bearing vectors
+     */
+    double compute_bearing_angle_error(double const* const* parameters) const;
+
 private:
     Eigen::Vector2d m_observation;    // Observed pixel coordinates
     Eigen::Vector3d m_world_point;    // 3D world coordinates
@@ -160,6 +167,14 @@ public:
      * @return Chi-square error value
      */
     double compute_chi_square(double const* const* parameters) const;
+
+    /**
+     * @brief Compute bearing angle error for equirectangular outlier detection
+     * @param parameters[0] SE3 pose parameters in tangent space [6]
+     * @param parameters[1] 3D point position in world coordinates [3]
+     * @return Bearing angle error in radians
+     */
+    double compute_bearing_angle_error(double const* const* parameters) const;
 
 private:
     Eigen::Vector2d m_observation;    // Observed pixel coordinates

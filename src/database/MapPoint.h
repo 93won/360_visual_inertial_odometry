@@ -107,6 +107,9 @@ public:
     void SetTriangulated(bool triangulated = true) { m_is_triangulated = triangulated; }
     bool IsTriangulated() const { return m_is_triangulated; }
     
+    void SetFixed(bool fixed = true) { m_is_fixed = fixed; }
+    bool IsFixed() const { return m_is_fixed; }
+    
     // ============ Depth Management ============
     
     /**
@@ -130,6 +133,7 @@ private:
     
     bool m_is_bad;                               ///< Bad flag (invalid point)
     bool m_is_triangulated;                      ///< Successfully triangulated
+    bool m_is_fixed;                             ///< Fixed flag (do not optimize in BA)
     
     mutable std::mutex m_mutex;                  ///< Thread safety
     

@@ -27,7 +27,8 @@ namespace vio_360 {
 Estimator::Estimator()
     : m_frame_id_counter(0)
     , m_initialized(false)
-    , m_current_pose(Eigen::Matrix4f::Identity()) {
+    , m_current_pose(Eigen::Matrix4f::Identity())
+    , m_transform_from_last(Eigen::Matrix4f::Identity()) {
     
     // Initialize camera
     const auto& config = ConfigUtils::GetInstance();
@@ -148,11 +149,11 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             }
         }
         
+        // Always initialize pose from previous frame (for tracking continuity)
+        m_current_frame->SetTwb(m_previous_frame->GetTwb());
+        
         // Pose estimation using PnP
         if (valid_mp_count >= 6) {
-            // Initialize with previous pose as prior
-            m_current_frame->SetTwb(m_previous_frame->GetTwb());
-            
             // Run PnP optimization
             Optimizer optimizer;
             PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
@@ -164,10 +165,16 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             }
             
             if (pnp_result.success) {
+                // Set reference keyframe FIRST (before GetTwb)
+                if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
+                    m_current_frame->SetReferenceKeyframe(m_last_keyframe);
+                }
+                
                 m_current_pose = m_current_frame->GetTwb();
                 LOG_INFO("Frame {}: PnP {} in/{} out, reproj {:.2f}px, parallax {:.1f}px",
                          m_current_frame->GetFrameId(), pnp_result.num_inliers, pnp_result.num_outliers,
                          pnp_result.final_cost, parallax_from_kf);
+                
                 result.success = true;
             } else {
                 LOG_WARN("Frame {}: PnP failed", m_current_frame->GetFrameId());
@@ -295,11 +302,12 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             }
         }
         
+        // Constant velocity model: predict pose from previous frame
+        Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
+        m_current_frame->SetTwb(predicted_pose);
+        
         // Pose estimation using PnP
         if (valid_mp_count >= 6) {
-            // Initialize with previous pose as prior
-            m_current_frame->SetTwb(m_previous_frame->GetTwb());
-            
             // Run PnP optimization
             Optimizer optimizer;
             PnPResult pnp_result = optimizer.SolvePnP(m_current_frame);
@@ -311,10 +319,19 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             }
             
             if (pnp_result.success) {
+                // Set reference keyframe FIRST (before GetTwb)
+                if (m_last_keyframe && !m_current_frame->IsKeyframe()) {
+                    m_current_frame->SetReferenceKeyframe(m_last_keyframe);
+                }
+                
+                // Update current pose and transform for next frame
                 m_current_pose = m_current_frame->GetTwb();
+                m_transform_from_last = m_previous_frame->GetTwb().inverse() * m_current_pose;
+                
                 LOG_INFO("Frame {}: PnP {} in/{} out, reproj {:.2f}px, parallax {:.1f}px",
                          m_current_frame->GetFrameId(), pnp_result.num_inliers, pnp_result.num_outliers,
                          pnp_result.final_cost, parallax_from_kf);
+                
                 result.success = true;
             } else {
                 LOG_WARN("Frame {}: PnP failed", m_current_frame->GetFrameId());
@@ -429,6 +446,13 @@ bool Estimator::TryInitialize() {
     
     LOG_INFO("[Init] Monocular init SUCCESS: {} MapPoints created", init_result.initialized_mappoints.size());
     
+    // Mark initialization MapPoints as fixed (they define the scale)
+    for (const auto& mp : init_result.initialized_mappoints) {
+        if (mp) {
+            mp->SetFixed(true);
+        }
+    }
+    
     // Step 3: Store initialization results
     m_initialized_points = init_result.points3d;
     
@@ -459,6 +483,7 @@ void Estimator::Reset() {
     m_frame_id_counter = 0;
     m_initialized = false;
     m_current_pose = Eigen::Matrix4f::Identity();
+    m_transform_from_last = Eigen::Matrix4f::Identity();
 }
 
 std::shared_ptr<Frame> Estimator::CreateFrame(const cv::Mat& image, double timestamp) {
@@ -545,9 +570,39 @@ void Estimator::CreateKeyframe() {
     m_all_keyframes.push_back(m_current_frame);  // Also add to all keyframes list
     m_last_keyframe = m_current_frame;
     
+    // Add observations to MapPoints for this keyframe
+    // (MapPoints linked from previous frames now get this keyframe as observer)
+    const auto& features = m_current_frame->GetFeatures();
+    int obs_added = 0;
+    for (size_t i = 0; i < features.size(); ++i) {
+        auto mp = m_current_frame->GetMapPoint(static_cast<int>(i));
+        if (mp && !mp->IsBad() && features[i] && features[i]->IsValid()) {
+            // Check if this keyframe is already observing this MapPoint
+            if (!mp->IsObservedByFrame(m_current_frame)) {
+                mp->AddObservation(m_current_frame, static_cast<int>(i));
+                obs_added++;
+            }
+        }
+    }
+    
     // Maintain keyframe window size (remove oldest keyframes from front)
     const int max_keyframes = 10;  // TODO: make configurable
     while (static_cast<int>(m_keyframes.size()) > max_keyframes) {
+        auto oldest_keyframe = m_keyframes.front();
+        
+        // Clean up observations from MapPoints before removing the keyframe
+        const auto& features = oldest_keyframe->GetFeatures();
+        for (size_t i = 0; i < features.size(); ++i) {
+            auto mp = oldest_keyframe->GetMapPoint(static_cast<int>(i));
+            if (mp && !mp->IsBad()) {
+                mp->RemoveObservation(oldest_keyframe);
+                // Mark MapPoint as bad if no observations left
+                if (mp->GetObservationCount() == 0) {
+                    mp->SetBad(true);
+                }
+            }
+        }
+        
         m_keyframes.erase(m_keyframes.begin());  // Remove oldest (front)
     }
     
@@ -564,6 +619,13 @@ void Estimator::CreateKeyframe() {
         BAResult ba_result = optimizer.RunLocalBA(m_keyframes);  // Sliding window BA
         LOG_INFO("Local BA done: {} inliers, {} outliers", 
                  ba_result.num_inliers, ba_result.num_outliers);
+        
+        // Update m_current_pose with BA-optimized pose
+        m_current_pose = m_current_frame->GetTwb();
+        
+        // Reset m_transform_from_last to identity after BA
+        // Next frame will start from the BA-optimized keyframe pose
+        m_transform_from_last = Eigen::Matrix4f::Identity();
     }
     
     LOG_INFO("Created keyframe {} (total: {}), triangulated {} new MapPoints", 
@@ -802,25 +864,22 @@ bool Estimator::TriangulateSinglePoint(
     // Convert to 3D point
     point3d = singular_vector.head<3>() / singular_vector(3);
     
-    // Check depth is positive in both cameras (Stella VSLAM style)
-    // Transform point to camera coordinates and check z > 0
-    Eigen::Vector4f point_h(point3d.x(), point3d.y(), point3d.z(), 1.0f);
+    // Stella VSLAM style: Equirectangular cameras skip depth check
+    // because they can see in all directions (no "behind camera" concept)
+    // Reference: stella_vslam/module/two_view_triangulator.h check_depth_is_positive()
+    // "return camera->model_type_ == camera::model_type_t::Equirectangular || 0 < pos_z;"
     
-    Eigen::Vector4f pc1 = T1w * point_h;
-    Eigen::Vector4f pc2 = T2w * point_h;
-    
-    // For equirectangular, check that the point is in the direction of the bearing
-    // (dot product should be positive)
-    float dot1 = pc1.head<3>().normalized().dot(bearing1);
-    float dot2 = pc2.head<3>().normalized().dot(bearing2);
-    
-    if (dot1 <= 0.0f || dot2 <= 0.0f) {
-        return false;  // Point behind camera
+    // Only check for valid (finite) coordinates and reasonable range
+    if (!std::isfinite(point3d.x()) || !std::isfinite(point3d.y()) || !std::isfinite(point3d.z())) {
+        return false;
     }
     
-    // Check reasonable depth range
-    float depth1 = pc1.head<3>().norm();
-    float depth2 = pc2.head<3>().norm();
+    // Check reasonable depth range (distance from cameras)
+    Eigen::Vector3f cam1_center = -T1w.block<3,3>(0,0).transpose() * T1w.block<3,1>(0,3);
+    Eigen::Vector3f cam2_center = -T2w.block<3,3>(0,0).transpose() * T2w.block<3,1>(0,3);
+    
+    float depth1 = (point3d - cam1_center).norm();
+    float depth2 = (point3d - cam2_center).norm();
     
     constexpr float kMinDepth = 0.1f;
     constexpr float kMaxDepth = 100.0f;

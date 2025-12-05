@@ -159,8 +159,9 @@ void FeatureTracker::TrackFeatures(std::shared_ptr<Frame> current_frame,
     current_frame->AssignFeaturesToGrid();
     current_frame->LimitFeaturesPerGrid();
     
-    // Detect new features if needed
-    if (current_frame->GetFeatureCount() < static_cast<size_t>(m_max_features * 0.5f)) {
+    // Detect new features if current count < max_features
+    // Use feature mask to only detect in empty regions (outliers are not masked)
+    if (current_frame->GetFeatureCount() < static_cast<size_t>(m_max_features)) {
         cv::Mat mask = CreateFeatureMask(current_frame->GetFeatures());
         std::vector<cv::Point2f> new_points = DetectNewFeatures(current_image, mask);
         
@@ -371,8 +372,12 @@ cv::Mat FeatureTracker::CreateFeatureMask(
     
     cv::Mat mask = m_polar_mask.clone();
     
-    // Mask out regions around existing features
+    // Mask out regions around existing valid features only
+    // Outliers are NOT masked so new features can be detected in their place
     for (const auto& feature : existing_features) {
+        if (!feature->IsValid()) {
+            continue;  // Skip outliers - allow new features in their place
+        }
         cv::Point2f pt = feature->GetPixelCoord();
         cv::circle(mask, pt, static_cast<int>(m_min_distance), 0, -1);
     }

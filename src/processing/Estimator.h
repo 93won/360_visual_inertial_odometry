@@ -201,6 +201,9 @@ private:
     // Current pose (T_wc: world to camera)
     Eigen::Matrix4f m_current_pose;
     
+    // Constant velocity model: transformation from last frame to current frame
+    Eigen::Matrix4f m_transform_from_last;
+    
     /**
      * @brief Create a new frame
      * @param image Input image

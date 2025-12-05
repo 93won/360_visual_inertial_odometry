@@ -228,6 +228,56 @@ double PnPFactor::compute_chi_square(double const* const* parameters) const {
     return chi2_error;
 }
 
+double PnPFactor::compute_bearing_angle_error(double const* const* parameters) const {
+    // Extract SE3 parameters from tangent space
+    Eigen::Map<const Eigen::Vector6d> se3_tangent(parameters[0]);
+    
+    // Convert tangent space to SE3
+    vio_360::SE3d T_wb = vio_360::SE3d::exp(se3_tangent);
+    
+    // Convert T_wb (b→w) to T_cw (w→c) transformation
+    Eigen::Matrix3d R_wb = T_wb.rotationMatrix();
+    Eigen::Vector3d t_wb = T_wb.translation();
+    Eigen::Matrix3d R_bw = R_wb.transpose();
+    Eigen::Vector3d t_bw = -R_bw * t_wb;
+    
+    Eigen::Matrix3d R_cw = m_Tcb.block<3, 3>(0, 0) * R_bw;
+    Eigen::Vector3d t_cw = m_Tcb.block<3, 3>(0, 0) * t_bw + m_Tcb.block<3, 1>(0, 3);
+    
+    // Transform world point to camera coordinates
+    Eigen::Vector3d point_camera = R_cw * m_world_point + t_cw;
+    double L_proj = point_camera.norm();
+    
+    if (L_proj < 1e-10) {
+        return M_PI; // Invalid point, return maximum angle
+    }
+    
+    // Bearing from projected 3D point
+    Eigen::Vector3d bearing_proj = point_camera / L_proj;
+    
+    // Bearing from observation (pixel to unit sphere)
+    double cols = m_camera_params.cols;
+    double rows = m_camera_params.rows;
+    
+    // Inverse equirectangular: pixel → (theta, phi) → unit vector
+    double theta_obs = (m_observation.x() / cols - 0.5) * 2.0 * M_PI;
+    double phi_obs = -(m_observation.y() / rows - 0.5) * M_PI;
+    
+    // Bearing vector: (cos(phi)*sin(theta), -sin(phi), cos(phi)*cos(theta))
+    double cos_phi = std::cos(phi_obs);
+    double sin_phi = std::sin(phi_obs);
+    double cos_theta = std::cos(theta_obs);
+    double sin_theta = std::sin(theta_obs);
+    
+    Eigen::Vector3d bearing_obs(cos_phi * sin_theta, -sin_phi, cos_phi * cos_theta);
+    
+    // Angle between bearings: acos(dot product)
+    double dot = bearing_obs.dot(bearing_proj);
+    dot = std::clamp(dot, -1.0, 1.0); // Numerical stability
+    
+    return std::acos(dot);
+}
+
 // BAFactor implementation
 BAFactor::BAFactor(const Eigen::Vector2d& observation,
                    const CameraParameters& camera_params,
@@ -383,8 +433,9 @@ bool BAFactor::Evaluate(double const* const* parameters,
             
             // Jacobian w.r.t pose (SE3 tangent space)
             if (jacobians[0]) {
-                // Body point in body frame: Pb = Rbw * (Pw - twb)
-                Eigen::Vector3d body_point = Rbw * (world_point - twb);
+                // Body point in body frame: Pb = Rbw * Pw + tbw
+                // This matches PnPFactor: Pb = R_bw * m_world_point + t_bw
+                Eigen::Vector3d body_point = Rbw * world_point + tbw;
                 
                 // Jacobian of camera point w.r.t body translation
                 Eigen::Matrix<double, 3, 3> J_camera_trans = -m_Tcb.block<3, 3>(0, 0);
@@ -392,10 +443,11 @@ bool BAFactor::Evaluate(double const* const* parameters,
                 // Jacobian of camera point w.r.t body rotation  
                 Eigen::Matrix<double, 3, 3> J_camera_rot = m_Tcb.block<3, 3>(0, 0) * vio_360::SO3d::hat(body_point);
                 
-                // Combine rotation and translation jacobians [3x6]
+                // Combine translation and rotation jacobians [3x6]
+                // Parameter order: [tx, ty, tz, rx, ry, rz] - same as PnPFactor
                 Eigen::Matrix<double, 3, 6> J_camera_pose;
-                J_camera_pose.block<3, 3>(0, 0) = J_camera_rot;  // w.r.t rotation
-                J_camera_pose.block<3, 3>(0, 3) = J_camera_trans; // w.r.t translation
+                J_camera_pose.block<3, 3>(0, 0) = J_camera_trans; // Column 0-2: w.r.t translation
+                J_camera_pose.block<3, 3>(0, 3) = J_camera_rot;   // Column 3-5: w.r.t rotation
                 
                 // Chain rule: J_residual_pose = J_proj_camera * J_camera_pose
                 Eigen::Matrix<double, 2, 6> J_pose = weighted_J_proj * J_camera_pose;
@@ -448,18 +500,18 @@ double BAFactor::compute_chi_square(double const* const* parameters) const {
     // Extract 3D point
     Eigen::Map<const Eigen::Vector3d> world_point(parameters[1]);
     
-    // Transform world point to camera coordinates
+    // Transform world point to camera coordinates (same as Evaluate())
     Eigen::Matrix3d Rwb = Twb.rotationMatrix();
     Eigen::Vector3d twb = Twb.translation();
     Eigen::Matrix3d Rbw = Rwb.transpose();
+    Eigen::Vector3d tbw = -Rbw * twb;
     
-    // Body coordinates: Pb = Rbw * (Pw - twb)
-    Eigen::Vector3d body_point = Rbw * (world_point - twb);
+    // Tcw = Tcb * Tbw
+    Eigen::Matrix3d Rcw = m_Tcb.block<3, 3>(0, 0) * Rbw;
+    Eigen::Vector3d tcw = m_Tcb.block<3, 3>(0, 0) * tbw + m_Tcb.block<3, 1>(0, 3);
     
-    // Camera coordinates: Pc = Tcb * [Pb; 1]
-    Eigen::Vector4d body_point_h(body_point.x(), body_point.y(), body_point.z(), 1.0);
-    Eigen::Vector4d camera_point_h = m_Tcb * body_point_h;
-    Eigen::Vector3d camera_point = camera_point_h.head<3>();
+    // Camera coordinates: Pc = Rcw * Pw + tcw
+    Eigen::Vector3d camera_point = Rcw * world_point + tcw;
     
     double pcx = camera_point.x();
     double pcy = camera_point.y();
@@ -489,6 +541,59 @@ double BAFactor::compute_chi_square(double const* const* parameters) const {
     double chi_square = error.transpose() * m_information * error;
     
     return chi_square;
+}
+
+double BAFactor::compute_bearing_angle_error(double const* const* parameters) const {
+    if (m_is_outlier) {
+        return 0.0;
+    }
+    
+    // Extract SE3 pose from parameters
+    Eigen::Map<const Eigen::Vector6d> se3_tangent(parameters[0]);
+    vio_360::SE3d Twb = vio_360::SE3d::exp(se3_tangent);
+    
+    // Extract 3D point
+    Eigen::Map<const Eigen::Vector3d> world_point(parameters[1]);
+    
+    // Transform world point to camera coordinates
+    Eigen::Matrix3d Rwb = Twb.rotationMatrix();
+    Eigen::Vector3d twb = Twb.translation();
+    Eigen::Matrix3d Rbw = Rwb.transpose();
+    Eigen::Vector3d tbw = -Rbw * twb;
+    
+    Eigen::Matrix3d Rcw = m_Tcb.block<3, 3>(0, 0) * Rbw;
+    Eigen::Vector3d tcw = m_Tcb.block<3, 3>(0, 0) * tbw + m_Tcb.block<3, 1>(0, 3);
+    
+    Eigen::Vector3d camera_point = Rcw * world_point + tcw;
+    double L_proj = camera_point.norm();
+    
+    if (L_proj < 1e-10) {
+        return M_PI; // Invalid point, return maximum angle
+    }
+    
+    // Bearing from projected 3D point
+    Eigen::Vector3d bearing_proj = camera_point / L_proj;
+    
+    // Bearing from observation (pixel to unit sphere)
+    double cols = m_camera_params.cols;
+    double rows = m_camera_params.rows;
+    
+    // Inverse equirectangular: pixel → (theta, phi) → unit vector
+    double theta_obs = (m_observation.x() / cols - 0.5) * 2.0 * M_PI;
+    double phi_obs = -(m_observation.y() / rows - 0.5) * M_PI;
+    
+    double cos_phi = std::cos(phi_obs);
+    double sin_phi = std::sin(phi_obs);
+    double cos_theta = std::cos(theta_obs);
+    double sin_theta = std::sin(theta_obs);
+    
+    Eigen::Vector3d bearing_obs(cos_phi * sin_theta, -sin_phi, cos_phi * cos_theta);
+    
+    // Angle between bearings
+    double dot = bearing_obs.dot(bearing_proj);
+    dot = std::clamp(dot, -1.0, 1.0);
+    
+    return std::acos(dot);
 }
 
 // ===============================================================================

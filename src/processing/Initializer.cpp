@@ -162,8 +162,10 @@ bool Initializer::TryMonocularInitialization(
     
     LOG_INFO("  [MonoInit] Validation passed, mean_reproj={:.2f}px", mean_reproj_error);
     
-    // 8. Normalize scale: median depth = 1.0 (like lightweight_vio)
-    float scale_factor = NormalizeScale(points3d, t);
+    // 8. Skip scale normalization - keep original scale from triangulation
+    // This is important for VIO where IMU provides absolute scale
+    // float scale_factor = NormalizeScale(points3d, t);
+    float scale_factor = 1.0f;  // Keep original scale
     
     // 9. Set frame poses
     // Essential matrix gives us camera-to-camera transformation T_c1c2
@@ -542,6 +544,13 @@ bool Initializer::ComputeEssentialMatrix(
             }
         }
         
+        // Debug: print error distribution on first iteration
+        if (iter == 0) {
+            std::sort(errors.begin(), errors.end());
+            LOG_INFO("  [Essential] Iter0 errors: min={:.4f}, median={:.4f}, max={:.4f}, thresh={:.4f}",
+                     errors.front(), errors[errors.size()/2], errors.back(), m_ransac_threshold);
+        }
+        
         // 4. Update best model
         if (num_inliers > best_inliers) {
             best_inliers = num_inliers;
@@ -550,13 +559,11 @@ bool Initializer::ComputeEssentialMatrix(
         }
     }
     
-    // Check if we have enough inliers
-    float inlier_ratio = static_cast<float>(best_inliers) / num_points;
+    // Check if we have enough inliers (use absolute count, not ratio)
+    LOG_INFO("  [Essential] best_inliers={}, num_points={}, min_required={}", 
+             best_inliers, num_points, m_min_features);
     
-    LOG_INFO("  [Essential] best_inliers={}, num_points={}, ratio={:.2f} (min={:.2f})", 
-             best_inliers, num_points, inlier_ratio, m_min_inlier_ratio);
-    
-    if (inlier_ratio < m_min_inlier_ratio) {
+    if (best_inliers < m_min_features) {
         return false;
     }
     
@@ -655,13 +662,17 @@ bool Initializer::RecoverPose(
             inlier_mask
         );
         
+        LOG_INFO("  [RecoverPose] Candidate {}: good_points={}", i, good_points);
+        
         if (good_points > best_count) {
             best_count = good_points;
             best_idx = i;
         }
     }
     
-    if (best_idx < 0 || best_count < 50) {
+    LOG_INFO("  [RecoverPose] Best: idx={}, count={}, min_required={}", best_idx, best_count, m_min_features);
+    
+    if (best_idx < 0 || best_count < m_min_features) {
         return false;
     }
     
@@ -716,20 +727,7 @@ bool Initializer::TriangulateSinglePoint(
     // Transform bearing2 to frame1 coordinates
     const Eigen::Vector3f bearing2_in_frame1 = R.transpose() * bearing2;
     
-    // Stella VSLAM style: Check ray directions before triangulation
-    // cos_rays_parallax must be positive (rays must point in similar direction)
-    const float cos_rays_parallax = bearing1.dot(bearing2_in_frame1);
-    if (cos_rays_parallax <= 0.0f) {
-        // Rays pointing in opposite directions - invalid for triangulation
-        return false;
-    }
-    
-    // Also check for minimum parallax (Stella VSLAM uses ~1 degree threshold)
-    constexpr float cos_rays_parallax_thr = 0.9998f;  // cos(1 degree) ≈ 0.9998
-    if (cos_rays_parallax >= cos_rays_parallax_thr) {
-        // Insufficient parallax - rays are too parallel
-        return false;
-    }
+   
     
     // Build the linear system: A * lambda = b
     // Ray1: p1 = λ1 * bearing1
@@ -754,17 +752,10 @@ bool Initializer::TriangulateSinglePoint(
     // Solve for lambda
     const Eigen::Vector2f lambda = A.inverse() * b;
     
-    // For valid triangulation, both lambda values should be positive
-    // (point should be in front of both rays in their respective directions)
-    if (lambda(0) <= 0.0f || lambda(1) <= 0.0f) {
-        return false;
-    }
-    
-    // Check for reasonable depth range
-    constexpr float kMinDepth = 0.01f;
-    constexpr float kMaxDepth = 100.0f;
-    if (lambda(0) < kMinDepth || lambda(1) < kMinDepth ||
-        lambda(0) > kMaxDepth || lambda(1) > kMaxDepth) {
+    // Stella VSLAM style: For equirectangular cameras, skip depth positive check
+    // (depth_is_positive = false for bearing_vector initializer)
+    // Only check for finite values
+    if (!std::isfinite(lambda(0)) || !std::isfinite(lambda(1))) {
         return false;
     }
     
@@ -786,20 +777,45 @@ int Initializer::TestPoseCandidate(
     const std::vector<bool>& inlier_mask
 ) const {
     int good_points = 0;
+    int tri_fail = 0;
+    int reproj_fail = 0;
+    
+    // Stella VSLAM style: For equirectangular, use reprojection error to validate
+    // instead of cheirality check
     
     for (size_t i = 0; i < bearings1.size(); ++i) {
         if (!inlier_mask[i]) continue;
         
-        // Triangulate 3D point
+        // Triangulate 3D point (in frame1 coordinates)
         Eigen::Vector3f point3d;
         if (!TriangulateSinglePoint(bearings1[i], bearings2[i], R, t, point3d)) {
+            tri_fail++;
             continue;
         }
         
-        // For 360 cameras, skip cheirality check as the camera can see all directions.
-        // The point validity is already checked in TriangulateSinglePoint.
+        // Check reprojection error in frame1 (reference)
+        float err_ref = ComputeReprojectionErrorInFrame(point3d, bearings1[i]);
         
-        good_points++;
+        // Check reprojection error in frame2 (current)
+        Eigen::Vector3f point_in_frame2 = R * point3d + t;
+        float err_cur = ComputeReprojectionErrorInFrame(point_in_frame2, bearings2[i]);
+        
+        // Use reprojection error threshold (Stella VSLAM uses reproj_err_thr_)
+        constexpr float kReprojErrThr = 5.0f;  // pixels
+        if (err_ref < kReprojErrThr && err_cur < kReprojErrThr) {
+            good_points++;
+        } else {
+            reproj_fail++;
+        }
+    }
+    
+    // Debug first candidate only
+    static bool first_debug = true;
+    if (first_debug) {
+        int total_inliers = std::count(inlier_mask.begin(), inlier_mask.end(), true);
+        LOG_INFO("    [TestPose Debug] inliers={}, tri_fail={}, reproj_fail={}, good={}", 
+                 total_inliers, tri_fail, reproj_fail, good_points);
+        first_debug = false;
     }
     
     return good_points;
@@ -956,13 +972,7 @@ bool Initializer::ValidateInitialization(
              errors_pixel[3*n/4], errors_pixel[std::min(n-1, (size_t)(n*0.9))],
              errors_pixel[std::min(n-1, (size_t)(n*0.95))], errors_pixel[n-1]);
     
-    // Validation check 1: Inlier ratio
-    if (valid_ratio < m_min_inlier_ratio) {
-        LOG_WARN("  [Validate] FAIL: valid_ratio {:.2f} < min_ratio {:.2f}", valid_ratio, m_min_inlier_ratio);
-        return false;
-    }
-    
-    // Validation check 2: Minimum number of points
+    // Validation check: Minimum number of points (ratio check removed for 360 cameras)
     if (valid_count < m_min_features) {
         LOG_WARN("  [Validate] FAIL: valid_count {} < min_features {}", valid_count, m_min_features);
         return false;

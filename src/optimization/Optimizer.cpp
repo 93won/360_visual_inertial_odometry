@@ -30,7 +30,8 @@ Optimizer::Optimizer()
 }
 
 void Optimizer::PoseToParams(const Eigen::Matrix4f& pose, double* params) {
-    // Convert SE3 matrix to tangent space [rot(3), trans(3)]
+    // Convert SE3 matrix to tangent space [trans(3), rot(3)]
+    // Order matches Jacobian column order in PnPFactor and BAFactor
     Eigen::Matrix3f R = pose.block<3, 3>(0, 0);
     Eigen::Vector3f t = pose.block<3, 1>(0, 3);
     
@@ -38,19 +39,20 @@ void Optimizer::PoseToParams(const Eigen::Matrix4f& pose, double* params) {
     Eigen::AngleAxisf aa(R);
     Eigen::Vector3f axis_angle = aa.axis() * aa.angle();
     
-    // [rotation, translation]
-    params[0] = axis_angle.x();
-    params[1] = axis_angle.y();
-    params[2] = axis_angle.z();
-    params[3] = t.x();
-    params[4] = t.y();
-    params[5] = t.z();
+    // [translation, rotation] - matches Jacobian order
+    params[0] = t.x();
+    params[1] = t.y();
+    params[2] = t.z();
+    params[3] = axis_angle.x();
+    params[4] = axis_angle.y();
+    params[5] = axis_angle.z();
 }
 
 Eigen::Matrix4f Optimizer::ParamsToPose(const double* params) {
-    // Convert tangent space [rot(3), trans(3)] to SE3 matrix
-    Eigen::Vector3f axis_angle(params[0], params[1], params[2]);
-    Eigen::Vector3f t(params[3], params[4], params[5]);
+    // Convert tangent space [trans(3), rot(3)] to SE3 matrix
+    // Order matches PoseToParams
+    Eigen::Vector3f t(params[0], params[1], params[2]);
+    Eigen::Vector3f axis_angle(params[3], params[4], params[5]);
     
     float angle = axis_angle.norm();
     Eigen::Matrix3f R;
@@ -167,30 +169,28 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         final_cost = summary.final_cost;
         total_iterations += summary.iterations.size();
         
-        // Outlier detection using chi-square test
+        // Bearing-based outlier detection for equirectangular cameras
+        // Threshold: 2 degrees = 0.035 radians (more lenient than Stella's 1 degree)
+        const double bearing_threshold = 2.0 * M_PI / 180.0;  // 2 degrees in radians
+        
         const double* params_ptr = pose_params;
         int num_inliers = 0;
         int num_outliers = 0;
         double inlier_reproj_sum = 0.0;
         
         for (size_t i = 0; i < factors.size(); ++i) {
-            double chi2 = factors[i]->compute_chi_square(&params_ptr);
-            bool is_outlier = (chi2 > m_chi2_threshold);
+            double bearing_error = factors[i]->compute_bearing_angle_error(&params_ptr);
+            bool is_outlier = (bearing_error > bearing_threshold);
             
             factors[i]->set_outlier(is_outlier);
-            
-            // Mark feature as invalid if outlier
-            auto& feature = frame->GetFeatures()[feature_indices[i]];
-            if (feature) {
-                feature->SetValid(!is_outlier);
-            }
             
             if (is_outlier) {
                 num_outliers++;
             } else {
                 num_inliers++;
-                // Accumulate inlier reprojection error (sqrt of chi2 for pixel error)
-                inlier_reproj_sum += std::sqrt(chi2);
+                // Convert bearing error to approximate pixel error for logging
+                // (bearing_error * image_width / (2*pi) gives rough pixel equivalent)
+                inlier_reproj_sum += bearing_error * 180.0 / M_PI;  // degrees for logging
             }
         }
         
@@ -321,46 +321,50 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     
-    // Outlier detection and MapPoint quality assessment
+    // Bearing-based outlier detection for equirectangular cameras
+    const double bearing_threshold = 2.0 * M_PI / 180.0;  // 2 degrees
+    
     int num_inliers = 0;
     int num_outliers = 0;
     
-    // Count inliers/outliers per MapPoint
-    std::map<size_t, int> mp_inlier_count;
-    std::map<size_t, int> mp_outlier_count;
+    // Count MapPoint outliers using bearing angle error
+    std::map<std::shared_ptr<MapPoint>, int> mp_outlier_count;
+    std::map<std::shared_ptr<MapPoint>, int> mp_inlier_count;
     
     for (size_t i = 0; i < factors.size(); ++i) {
-        auto [fi, pi] = factor_indices[i];
+        size_t fi = factor_indices[i].first;
+        size_t pi = factor_indices[i].second;
+        
         const double* params[2] = {pose_params[fi].data(), point_params[pi].data()};
-        double chi2 = factors[i]->compute_chi_square(params);
-        if (chi2 > m_chi2_threshold) {
+        double bearing_error = factors[i]->compute_bearing_angle_error(params);
+        
+        bool is_outlier = (bearing_error > bearing_threshold);
+        factors[i]->set_outlier(is_outlier);
+        
+        if (is_outlier) {
             num_outliers++;
-            mp_outlier_count[pi]++;
+            mp_outlier_count[mappoints[pi]]++;
         } else {
             num_inliers++;
-            mp_inlier_count[pi]++;
+            mp_inlier_count[mappoints[pi]]++;
         }
     }
     
-    // Mark MapPoints as bad only if ALWAYS outlier (never inlier in any observation)
-    // This is much more conservative - only remove truly bad points
+    // Mark MapPoints as bad if ALL observations are outliers (more conservative)
     int bad_mp_count = 0;
-    for (size_t i = 0; i < mappoints.size(); ++i) {
-        int inliers = mp_inlier_count[i];
-        int outliers = mp_outlier_count[i];
-        int total = inliers + outliers;
-        
-        // Only mark as bad if:
-        // 1. Has observations but ZERO inliers (all outliers), AND
-        // 2. Has at least 2 outlier observations (need enough evidence)
-        if (total >= 2 && inliers == 0) {
-            mappoints[i]->SetBad(true);
+    for (const auto& mp : mappoints) {
+        int inliers = mp_inlier_count[mp];
+        int outliers = mp_outlier_count[mp];
+        // Only mark bad if no inliers at all and at least 2 outlier observations
+        if (inliers == 0 && outliers >= 2) {
+            mp->SetBad();
             bad_mp_count++;
         }
     }
     
     if (bad_mp_count > 0) {
-        LOG_INFO("  Marked {} MapPoints as bad (zero inliers)", bad_mp_count);
+        LOG_INFO("  RunBA: marked {} MapPoints as bad (bearing threshold: {:.1f}°)", 
+                 bad_mp_count, bearing_threshold * 180.0 / M_PI);
     }
     
     // Update frames and MapPoints
@@ -525,32 +529,72 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         poses_in_problem.insert(fi);
     }
     
-    // Fix poses:
-    // 1. First frame in window is always fixed (gauge freedom)
-    // 2. All frames outside window are fixed
-    
-    // Find first window frame index and fix it
-    for (size_t i = 0; i < all_frames.size(); ++i) {
-        if (all_frames[i] == window_frames.front()) {
-            if (poses_in_problem.count(i) > 0) {
-                problem.SetParameterBlockConstant(pose_params[i].data());
-            }
-            break;
-        }
+    // Build a map from window_frames index to all_frames index
+    std::map<std::shared_ptr<Frame>, size_t> window_frame_order;
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        window_frame_order[window_frames[i]] = i;
     }
     
-    // Fix all out-of-window frames (only if they have residuals in the problem)
+    // Fix at least half of the window keyframes (minimum 2)
+    size_t num_to_fix = std::max(size_t(2), (window_frames.size() + 1) / 2);
+    num_to_fix = std::min(num_to_fix, window_frames.size());
+    
+    // Build set of fixed frames for MapPoint checking
+    std::set<std::shared_ptr<Frame>> fixed_window_frames;
+    for (size_t i = 0; i < num_to_fix && i < window_frames.size(); ++i) {
+        fixed_window_frames.insert(window_frames[i]);
+    }
+    // Also add out-of-window frames to fixed set
+    for (const auto& f : fixed_frames_set) {
+        fixed_window_frames.insert(f);
+    }
+    
     int fixed_count = 0;
-    for (const auto& fixed_frame : fixed_frames_set) {
-        auto it = frame_to_idx.find(fixed_frame);
-        if (it != frame_to_idx.end() && poses_in_problem.count(it->second) > 0) {
-            problem.SetParameterBlockConstant(pose_params[it->second].data());
+    int optimized_count = 0;
+    for (size_t i = 0; i < all_frames.size(); ++i) {
+        if (poses_in_problem.count(i) == 0) continue;
+        
+        // Check if this is a window frame and its position
+        auto it = window_frame_order.find(all_frames[i]);
+        bool should_fix = true;
+        
+        if (it != window_frame_order.end()) {
+            // Window frame: fix if in first num_to_fix, otherwise optimize
+            size_t window_idx = it->second;
+            should_fix = (window_idx < num_to_fix);
+        }
+        // Out-of-window frames are always fixed (should_fix = true by default)
+        
+        if (should_fix) {
+            problem.SetParameterBlockConstant(pose_params[i].data());
             fixed_count++;
+        } else {
+            optimized_count++;
         }
     }
     
-    LOG_INFO("  LocalBA: {} window frames, {} fixed frames, {} MapPoints, {} factors",
-             window_frames.size(), fixed_count, mappoints.size(), factors.size());
+    // Fix MapPoints marked as fixed (initialization MapPoints that define scale)
+    int fixed_mp_count = 0;
+    for (size_t i = 0; i < mappoints.size(); ++i) {
+        if (mappoints[i]->IsFixed()) {
+            problem.SetParameterBlockConstant(point_params[i].data());
+            fixed_mp_count++;
+        }
+    }
+    
+    LOG_INFO("  LocalBA: {} window frames (fix first {}, optimize {}), {} out-of-window fixed, {} MapPoints ({} fixed), {} factors",
+             window_frames.size(), num_to_fix, optimized_count, 
+             fixed_count - static_cast<int>(num_to_fix), mappoints.size(), fixed_mp_count, factors.size());
+    
+    // Debug: print poses before BA
+    LOG_INFO("  Before BA poses:");
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        Eigen::Matrix4f T = window_frames[i]->GetTwb();
+        Eigen::Vector3f pos = T.block<3,1>(0,3);
+        LOG_INFO("    Frame {}: pos=({:.4f},{:.4f},{:.4f}){}", 
+                 window_frames[i]->GetFrameId(), pos.x(), pos.y(), pos.z(),
+                 i < num_to_fix ? " [FIXED]" : "");
+    }
     
     // Solve
     ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
@@ -558,60 +602,73 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     
-    // Outlier detection and MapPoint quality assessment
+    // Bearing-based outlier detection for equirectangular cameras
+    const double bearing_threshold = 2.0 * M_PI / 180.0;  // 2 degrees
+    
     int num_inliers = 0;
     int num_outliers = 0;
     
-    std::map<size_t, int> mp_inlier_count;
-    std::map<size_t, int> mp_outlier_count;
+    std::map<std::shared_ptr<MapPoint>, int> mp_outlier_count;
+    std::map<std::shared_ptr<MapPoint>, int> mp_inlier_count;
     
     for (size_t i = 0; i < factors.size(); ++i) {
-        auto [fi, pi] = factor_indices[i];
+        size_t fi = factor_indices[i].first;
+        size_t pi = factor_indices[i].second;
+        
         const double* params[2] = {pose_params[fi].data(), point_params[pi].data()};
-        double chi2 = factors[i]->compute_chi_square(params);
-        if (chi2 > m_chi2_threshold) {
+        double bearing_error = factors[i]->compute_bearing_angle_error(params);
+        
+        bool is_outlier = (bearing_error > bearing_threshold);
+        factors[i]->set_outlier(is_outlier);
+        
+        if (is_outlier) {
             num_outliers++;
-            mp_outlier_count[pi]++;
+            mp_outlier_count[mappoints[pi]]++;
         } else {
             num_inliers++;
-            mp_inlier_count[pi]++;
+            mp_inlier_count[mappoints[pi]]++;
         }
     }
     
-    // Mark MapPoints as bad only if ALWAYS outlier (never inlier in any observation)
-    // This is much more conservative - only remove truly bad points
+    // Mark MapPoints as bad if ALL observations are outliers
     int bad_mp_count = 0;
-    for (size_t i = 0; i < mappoints.size(); ++i) {
-        int inliers = mp_inlier_count[i];
-        int outliers = mp_outlier_count[i];
-        int total = inliers + outliers;
-        
-        // Only mark as bad if:
-        // 1. Has observations but ZERO inliers (all outliers), AND
-        // 2. Has at least 2 outlier observations (need enough evidence)
-        if (total >= 2 && inliers == 0) {
-            mappoints[i]->SetBad(true);
+    for (const auto& mp : mappoints) {
+        int inliers = mp_inlier_count[mp];
+        int outliers = mp_outlier_count[mp];
+        if (inliers == 0 && outliers >= 2) {
+            mp->SetBad();
             bad_mp_count++;
         }
     }
     
     if (bad_mp_count > 0) {
-        LOG_INFO("  Marked {} MapPoints as bad (zero inliers)", bad_mp_count);
+        LOG_INFO("  LocalBA: marked {} MapPoints as bad", bad_mp_count);
     }
     
-    // Update ONLY window frames poses (not fixed frames)
+    // Update only optimized window frame poses (those after num_to_fix)
     for (size_t i = 0; i < all_frames.size(); ++i) {
-        // Skip if this frame is in the fixed set
-        if (fixed_frames_set.find(all_frames[i]) != fixed_frames_set.end()) continue;
-        // Skip if this is the first window frame (also fixed)
-        if (all_frames[i] == window_frames.front()) continue;
+        auto it = window_frame_order.find(all_frames[i]);
+        if (it == window_frame_order.end()) continue;  // Skip out-of-window frames
+        
+        size_t window_idx = it->second;
+        if (window_idx < num_to_fix) continue;  // Skip fixed frames
         
         all_frames[i]->SetTwb(ParamsToPose(pose_params[i].data()));
     }
     
-    // Update MapPoints
+    // Debug: print poses after BA
+    LOG_INFO("  After BA poses:");
+    for (size_t i = 0; i < window_frames.size(); ++i) {
+        Eigen::Matrix4f T = window_frames[i]->GetTwb();
+        Eigen::Vector3f pos = T.block<3,1>(0,3);
+        LOG_INFO("    Frame {}: pos=({:.4f},{:.4f},{:.4f}){}", 
+                 window_frames[i]->GetFrameId(), pos.x(), pos.y(), pos.z(),
+                 i < num_to_fix ? " [FIXED]" : "");
+    }
+    
+    // Update MapPoints (skip fixed ones - they define scale)
     for (size_t i = 0; i < mappoints.size(); ++i) {
-        if (!mappoints[i]->IsBad()) {
+        if (!mappoints[i]->IsBad() && !mappoints[i]->IsFixed()) {
             Eigen::Vector3f pos(point_params[i][0], point_params[i][1], point_params[i][2]);
             mappoints[i]->SetPosition(pos);
         }
