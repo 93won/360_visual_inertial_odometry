@@ -1017,6 +1017,48 @@ int Estimator::TriangulateNewMapPoints(
         kf1->SetMapPoint(i1, mp);
         kf2->SetMapPoint(static_cast<int>(i2), mp);
         
+        // Also add observations from intermediate frames in the sliding window
+        // The feature in kf2 may have been tracked through multiple frames
+        const auto& feat_observations = features2[i2]->GetObservations();
+        for (const auto& obs : feat_observations) {
+            auto obs_frame = obs.frame;
+            if (!obs_frame) continue;
+            
+            // Skip if it's kf1 or kf2 (already added)
+            if (obs_frame->GetFrameId() == kf1->GetFrameId() ||
+                obs_frame->GetFrameId() == kf2->GetFrameId()) {
+                continue;
+            }
+            
+            // Only add if the frame is a keyframe in the current window
+            if (!obs_frame->IsKeyframe()) continue;
+            if (!IsKeyframeInWindow(obs_frame->GetFrameId())) continue;
+            
+            int obs_feat_idx = obs.feature_index;
+            
+            // Verify the observation is valid (check reprojection error)
+            const auto& obs_features = obs_frame->GetFeatures();
+            if (obs_feat_idx < 0 || obs_feat_idx >= static_cast<int>(obs_features.size())) {
+                continue;
+            }
+            
+            Eigen::Vector3f obs_bearing = obs_features[obs_feat_idx]->GetBearing();
+            Eigen::Matrix4f T_obs_w = obs_frame->GetTwc().inverse();
+            Eigen::Vector4f pt_h(point3d.x(), point3d.y(), point3d.z(), 1.0f);
+            Eigen::Vector3f pt_cam = (T_obs_w * pt_h).head<3>();
+            Eigen::Vector3f reproj_bearing = pt_cam.normalized();
+            
+            float dot = obs_bearing.dot(reproj_bearing);
+            float angle_error = std::acos(std::min(1.0f, std::abs(dot)));
+            float pixel_error = angle_error * obs_frame->GetWidth() / (2.0f * M_PI);
+            
+            // Only add if reprojection error is acceptable
+            if (pixel_error <= max_reproj_error) {
+                mp->AddObservation(obs_frame, obs_feat_idx);
+                obs_frame->SetMapPoint(obs_feat_idx, mp);
+            }
+        }
+        
         triangulated_count++;
     }
     

@@ -10,9 +10,9 @@ camera:
 feature_detection:
   max_features: 2000
   quality_level: 0.01
-  min_distance: 10.0
-  grid_cols: 40
-  grid_rows: 20
+  min_distance: 20.0
+  grid_cols: 20
+  grid_rows: 10
   max_features_per_grid: 4
 
 optical_flow:
@@ -28,15 +28,15 @@ ransac:
 
 tracking:
   min_features_ratio: 0.5
-  min_parallax_for_keyframe: 10.0  # Minimum parallax (pixels) to create new keyframe
+  min_parallax_for_keyframe: 5.0  # Minimum parallax (pixels) to create new keyframe
 
 initialization:
   window_size: 10
   min_parallax: 10.0
-  min_features: 20
+  min_features: 50
   min_observations: 10
-  grid_cols: 40
-  grid_rows: 20
+  grid_cols: 20
+  grid_rows: 10
   ransac_threshold: 0.1  # ~6 degrees (sin(6°) ≈ 0.1)
   ransac_iterations: 200
   min_inlier_ratio: 0.7

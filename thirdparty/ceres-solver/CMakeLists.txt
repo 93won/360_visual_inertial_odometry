@@ -771,9 +771,8 @@ if (PROVIDE_UNINSTALL_TARGET)
   configure_file("${Ceres_SOURCE_DIR}/cmake/uninstall.cmake.in"
                  "${Ceres_BINARY_DIR}/cmake/uninstall.cmake"
                  @ONLY)
-  # Disable uninstall target to avoid conflict with Pangolin
-  # add_custom_target(uninstall
-  #                  COMMAND ${CMAKE_COMMAND} -P ${Ceres_BINARY_DIR}/cmake/uninstall.cmake)
+  add_custom_target(uninstall
+                    COMMAND ${CMAKE_COMMAND} -P ${Ceres_BINARY_DIR}/cmake/uninstall.cmake)
 endif()
 
 # Install method #2: Put Ceres build into local CMake registry.

@@ -105,6 +105,13 @@ public:
      */
     double compute_bearing_angle_error(double const* const* parameters) const;
 
+    /**
+     * @brief Compute reprojection error in pixels for Stella VSLAM style outlier detection
+     * @param parameters SE3 pose parameters in tangent space [6]
+     * @return Squared reprojection error in pixels^2
+     */
+    double compute_reprojection_error_sq(double const* const* parameters) const;
+
 private:
     Eigen::Vector2d m_observation;    // Observed pixel coordinates
     Eigen::Vector3d m_world_point;    // 3D world coordinates
@@ -175,6 +182,14 @@ public:
      * @return Bearing angle error in radians
      */
     double compute_bearing_angle_error(double const* const* parameters) const;
+
+    /**
+     * @brief Compute reprojection error in pixels for Stella VSLAM style outlier detection
+     * @param parameters[0] SE3 pose parameters in tangent space [6]
+     * @param parameters[1] 3D point position in world coordinates [3]
+     * @return Squared reprojection error in pixels^2
+     */
+    double compute_reprojection_error_sq(double const* const* parameters) const;
 
 private:
     Eigen::Vector2d m_observation;    // Observed pixel coordinates

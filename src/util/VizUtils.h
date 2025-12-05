@@ -12,7 +12,15 @@
 
 #pragma once
 
-#include <pangolin/pangolin.h>
+#include <pangolin/display/display.h>
+#include <pangolin/display/view.h>
+#include <pangolin/display/widgets.h>
+#include <pangolin/gl/gl.h>
+#include <pangolin/gl/gldraw.h>
+#include <pangolin/gl/gltexturecache.h>
+#include <pangolin/handler/handler.h>
+#include <pangolin/var/var.h>
+#include <pangolin/var/varextra.h>
 #include <opencv2/opencv.hpp>
 #include <Eigen/Dense>
 #include <memory>

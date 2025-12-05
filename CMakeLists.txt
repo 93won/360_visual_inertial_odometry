@@ -22,13 +22,14 @@ find_package(Eigen3 REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(GLEW REQUIRED)
 
-# Add thirdparty libraries
+# Add thirdparty libraries - Pangolin
 set(BUILD_PANGOLIN_EXAMPLES OFF CACHE BOOL "Build Pangolin examples" FORCE)
 set(BUILD_PANGOLIN_TESTS OFF CACHE BOOL "Build Pangolin tests" FORCE)
 set(BUILD_PANGOLIN_TOOLS OFF CACHE BOOL "Build Pangolin tools" FORCE)
 set(BUILD_PANGOLIN_PYTHON OFF CACHE BOOL "Build Pangolin Python bindings" FORCE)
 add_subdirectory(thirdparty/pangolin EXCLUDE_FROM_ALL)
 
+# Add thirdparty libraries - Ceres
 set(BUILD_EXAMPLES OFF CACHE BOOL "Build Ceres examples" FORCE)
 set(BUILD_BENCHMARKS OFF CACHE BOOL "Build Ceres benchmarks" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "Build Ceres tests" FORCE)
@@ -38,9 +39,14 @@ add_subdirectory(thirdparty/ceres-solver EXCLUDE_FROM_ALL)
 # spdlog (header-only)
 add_subdirectory(thirdparty/spdlog EXCLUDE_FROM_ALL)
 
-# Include directories - thirdparty Pangolin ONLY (not system)
+# Include directories - thirdparty only
 include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/components/pango_core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/components/pango_display/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/components/pango_opengl/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/components/pango_image/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/components/pango_windowing/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/pangolin/components/pango_vars/include
     ${CMAKE_CURRENT_BINARY_DIR}/thirdparty/pangolin/include
     ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/ceres-solver/include
     ${CMAKE_CURRENT_BINARY_DIR}/thirdparty/ceres-solver/config

@@ -45,11 +45,11 @@
 #include <pangolin/gl/glvbo.h>
 #include <pangolin/handler/handler.h>
 #include <pangolin/image/image_io.h>
-#include <pangolin/plot/plotter.h>
+// #include <pangolin/plot/plotter.h>  // Disabled - pango_plot not built
 #include <pangolin/var/varextra.h>
-#include <pangolin/video/video.h>
-#include <pangolin/video/video_input.h>
-#include <pangolin/video/video_output.h>
+// #include <pangolin/video/video.h>  // Disabled - pango_video not built
+// #include <pangolin/video/video_input.h>
+// #include <pangolin/video/video_output.h>
 
 #ifdef _ANDROID_
 #  include <pangolin/display/device/display_android.h>

@@ -89,8 +89,19 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
     double v = rows * (0.5 - phi / M_PI);
     
     // Compute residuals: observation - projection
-    Eigen::Vector2d residual_vec;
-    residual_vec << m_observation.x() - u, m_observation.y() - v;
+    // Handle ERP wrap-around for horizontal coordinate
+    double du = m_observation.x() - u;
+    double dv = m_observation.y() - v;
+    
+    // Wrap horizontal residual to [-cols/2, cols/2] range
+    // This handles the 360° wrap-around at image boundaries
+    if (du > cols / 2.0) {
+        du -= cols;
+    } else if (du < -cols / 2.0) {
+        du += cols;
+    }
+    
+    Eigen::Vector2d residual_vec(du, dv);
 
     // Apply information matrix weighting to residuals: r_weighted = sqrt(Info) * r
     Eigen::LLT<Eigen::Matrix2d> llt(m_information);
@@ -219,8 +230,18 @@ double PnPFactor::compute_chi_square(double const* const* parameters) const {
     double v = rows * (0.5 - phi / M_PI);
     
     // Compute residuals: observation - projection
-    Eigen::Vector2d residual_vec;
-    residual_vec << m_observation.x() - u, m_observation.y() - v;
+    // Handle ERP wrap-around for horizontal coordinate
+    double du = m_observation.x() - u;
+    double dv = m_observation.y() - v;
+    
+    // Wrap horizontal residual to [-cols/2, cols/2] range
+    if (du > cols / 2.0) {
+        du -= cols;
+    } else if (du < -cols / 2.0) {
+        du += cols;
+    }
+    
+    Eigen::Vector2d residual_vec(du, dv);
     
     // Chi-square error with information matrix: r^T * Information * r
     double chi2_error = residual_vec.transpose() * m_information * residual_vec;
@@ -372,8 +393,19 @@ bool BAFactor::Evaluate(double const* const* parameters,
         double v = rows * (0.5 - phi / M_PI);
         
         // Compute residual: observed - projected
-        Eigen::Vector2d projected(u, v);
-        Eigen::Vector2d error = m_observation - projected;
+        // Handle ERP wrap-around for horizontal coordinate
+        double du = m_observation.x() - u;
+        double dv = m_observation.y() - v;
+        
+        // Wrap horizontal residual to [-cols/2, cols/2] range
+        // This handles the 360° wrap-around at image boundaries
+        if (du > cols / 2.0) {
+            du -= cols;
+        } else if (du < -cols / 2.0) {
+            du += cols;
+        }
+        
+        Eigen::Vector2d error(du, dv);
         
         // Apply information matrix weighting using Cholesky decomposition: r_weighted = sqrt(Info) * r
         Eigen::LLT<Eigen::Matrix2d> llt(m_information);
@@ -533,9 +565,18 @@ double BAFactor::compute_chi_square(double const* const* parameters) const {
     double u = cols * (0.5 + theta / (2.0 * M_PI));
     double v = rows * (0.5 - phi / M_PI);
     
-    // Compute unweighted error
-    Eigen::Vector2d projected(u, v);
-    Eigen::Vector2d error = m_observation - projected;
+    // Compute unweighted error with wrap-around handling
+    double du = m_observation.x() - u;
+    double dv = m_observation.y() - v;
+    
+    // Wrap horizontal residual to [-cols/2, cols/2] range
+    if (du > cols / 2.0) {
+        du -= cols;
+    } else if (du < -cols / 2.0) {
+        du += cols;
+    }
+    
+    Eigen::Vector2d error(du, dv);
     
     // Proper chi-square: error^T * Information * error
     double chi_square = error.transpose() * m_information * error;

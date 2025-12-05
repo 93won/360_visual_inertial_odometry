@@ -179,8 +179,8 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         double inlier_reproj_sum = 0.0;
         
         for (size_t i = 0; i < factors.size(); ++i) {
-            double bearing_error = factors[i]->compute_bearing_angle_error(&params_ptr);
-            bool is_outlier = (bearing_error > bearing_threshold);
+            double chi2 = factors[i]->compute_chi_square(&params_ptr);
+            bool is_outlier = (chi2 > 5.991);
             
             factors[i]->set_outlier(is_outlier);
             
@@ -190,7 +190,7 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
                 num_inliers++;
                 // Convert bearing error to approximate pixel error for logging
                 // (bearing_error * image_width / (2*pi) gives rough pixel equivalent)
-                inlier_reproj_sum += bearing_error * 180.0 / M_PI;  // degrees for logging
+                inlier_reproj_sum += chi2;  // degrees for logging
             }
         }
         
@@ -336,9 +336,9 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
         size_t pi = factor_indices[i].second;
         
         const double* params[2] = {pose_params[fi].data(), point_params[pi].data()};
-        double bearing_error = factors[i]->compute_bearing_angle_error(params);
+        double chi2 = factors[i]->compute_chi_square(params);
         
-        bool is_outlier = (bearing_error > bearing_threshold);
+        bool is_outlier = (chi2 > 5.991);
         factors[i]->set_outlier(is_outlier);
         
         if (is_outlier) {
@@ -362,10 +362,6 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
         }
     }
     
-    if (bad_mp_count > 0) {
-        LOG_INFO("  RunBA: marked {} MapPoints as bad (bearing threshold: {:.1f}°)", 
-                 bad_mp_count, bearing_threshold * 180.0 / M_PI);
-    }
     
     // Update frames and MapPoints
     for (size_t i = 0; i < frames.size(); ++i) {
@@ -431,27 +427,10 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         return result;
     }
     
-    // Step 2: Collect all frames that observe these MapPoints (including out-of-window frames)
-    std::set<std::shared_ptr<Frame>> all_frames_set(window_frames.begin(), window_frames.end());
-    std::set<std::shared_ptr<Frame>> fixed_frames_set;  // Frames outside window (will be fixed)
+    // Step 2: Only use window frames for BA (ignore out-of-window observations)
+    std::vector<std::shared_ptr<Frame>> all_frames(window_frames.begin(), window_frames.end());
     
-    for (const auto& mp : mappoints) {
-        const auto& observations = mp->GetObservations();
-        for (const auto& obs : observations) {
-            auto obs_frame = obs.frame.lock();
-            if (!obs_frame) continue;
-            
-            // Check if this frame is outside the window
-            if (window_frame_ids.find(obs_frame->GetFrameId()) == window_frame_ids.end()) {
-                // Frame is outside window - add to fixed frames
-                all_frames_set.insert(obs_frame);
-                fixed_frames_set.insert(obs_frame);
-            }
-        }
-    }
-    
-    // Convert to vector and create frame index map
-    std::vector<std::shared_ptr<Frame>> all_frames(all_frames_set.begin(), all_frames_set.end());
+    // Create frame index map
     std::map<std::shared_ptr<Frame>, size_t> frame_to_idx;
     for (size_t i = 0; i < all_frames.size(); ++i) {
         frame_to_idx[all_frames[i]] = i;
@@ -529,43 +508,17 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         poses_in_problem.insert(fi);
     }
     
-    // Build a map from window_frames index to all_frames index
-    std::map<std::shared_ptr<Frame>, size_t> window_frame_order;
-    for (size_t i = 0; i < window_frames.size(); ++i) {
-        window_frame_order[window_frames[i]] = i;
-    }
-    
-    // Fix at least half of the window keyframes (minimum 2)
-    size_t num_to_fix = std::max(size_t(2), (window_frames.size() + 1) / 2);
-    num_to_fix = std::min(num_to_fix, window_frames.size());
-    
-    // Build set of fixed frames for MapPoint checking
-    std::set<std::shared_ptr<Frame>> fixed_window_frames;
-    for (size_t i = 0; i < num_to_fix && i < window_frames.size(); ++i) {
-        fixed_window_frames.insert(window_frames[i]);
-    }
-    // Also add out-of-window frames to fixed set
-    for (const auto& f : fixed_frames_set) {
-        fixed_window_frames.insert(f);
-    }
-    
+    // For scale stability: fix ALL keyframes except the last one
+    // Only the last (newest) keyframe pose is optimized
     int fixed_count = 0;
     int optimized_count = 0;
+    size_t last_frame_idx = all_frames.size() - 1;
+    
     for (size_t i = 0; i < all_frames.size(); ++i) {
         if (poses_in_problem.count(i) == 0) continue;
         
-        // Check if this is a window frame and its position
-        auto it = window_frame_order.find(all_frames[i]);
-        bool should_fix = true;
-        
-        if (it != window_frame_order.end()) {
-            // Window frame: fix if in first num_to_fix, otherwise optimize
-            size_t window_idx = it->second;
-            should_fix = (window_idx < num_to_fix);
-        }
-        // Out-of-window frames are always fixed (should_fix = true by default)
-        
-        if (should_fix) {
+        if (i != last_frame_idx) {
+            // Fix all keyframes except the last one
             problem.SetParameterBlockConstant(pose_params[i].data());
             fixed_count++;
         } else {
@@ -573,27 +526,31 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         }
     }
     
-    // Fix MapPoints marked as fixed (initialization MapPoints that define scale)
+    // Fix MapPoints that are marked as fixed (initialization points define scale)
+    // Optimize MapPoints that are not fixed
     int fixed_mp_count = 0;
+    int optimized_mp_count = 0;
     for (size_t i = 0; i < mappoints.size(); ++i) {
         if (mappoints[i]->IsFixed()) {
             problem.SetParameterBlockConstant(point_params[i].data());
             fixed_mp_count++;
+        } else {
+            optimized_mp_count++;
         }
     }
     
-    LOG_INFO("  LocalBA: {} window frames (fix first {}, optimize {}), {} out-of-window fixed, {} MapPoints ({} fixed), {} factors",
-             window_frames.size(), num_to_fix, optimized_count, 
-             fixed_count - static_cast<int>(num_to_fix), mappoints.size(), fixed_mp_count, factors.size());
+    LOG_INFO("  LocalBA: {} window frames (fix {}, optimize last only), {} MapPoints ({} fixed, {} optimize), {} factors",
+             window_frames.size(), fixed_count, mappoints.size(), fixed_mp_count, optimized_mp_count, factors.size());
     
     // Debug: print poses before BA
     LOG_INFO("  Before BA poses:");
+    size_t last_idx = window_frames.size() - 1;
     for (size_t i = 0; i < window_frames.size(); ++i) {
         Eigen::Matrix4f T = window_frames[i]->GetTwb();
         Eigen::Vector3f pos = T.block<3,1>(0,3);
         LOG_INFO("    Frame {}: pos=({:.4f},{:.4f},{:.4f}){}", 
                  window_frames[i]->GetFrameId(), pos.x(), pos.y(), pos.z(),
-                 i < num_to_fix ? " [FIXED]" : "");
+                 i != last_idx ? " [FIXED]" : " [OPTIMIZE]");
     }
     
     // Solve
@@ -602,8 +559,9 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     
-    // Bearing-based outlier detection for equirectangular cameras
-    const double bearing_threshold = 2.0 * M_PI / 180.0;  // 2 degrees
+    // Chi-square based outlier detection (Stella VSLAM style)
+    // chi_sq_2D = 5.99146 for 2 DOF with 5% significance level
+    constexpr double chi_sq_threshold = 5.99146;
     
     int num_inliers = 0;
     int num_outliers = 0;
@@ -616,9 +574,9 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         size_t pi = factor_indices[i].second;
         
         const double* params[2] = {pose_params[fi].data(), point_params[pi].data()};
-        double bearing_error = factors[i]->compute_bearing_angle_error(params);
+        double chi2 = factors[i]->compute_chi_square(params);
         
-        bool is_outlier = (bearing_error > bearing_threshold);
+        bool is_outlier = (chi2 > chi_sq_threshold);
         factors[i]->set_outlier(is_outlier);
         
         if (is_outlier) {
@@ -645,16 +603,9 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         LOG_INFO("  LocalBA: marked {} MapPoints as bad", bad_mp_count);
     }
     
-    // Update only optimized window frame poses (those after num_to_fix)
-    for (size_t i = 0; i < all_frames.size(); ++i) {
-        auto it = window_frame_order.find(all_frames[i]);
-        if (it == window_frame_order.end()) continue;  // Skip out-of-window frames
-        
-        size_t window_idx = it->second;
-        if (window_idx < num_to_fix) continue;  // Skip fixed frames
-        
-        all_frames[i]->SetTwb(ParamsToPose(pose_params[i].data()));
-    }
+    // Update only the last keyframe pose (only one being optimized)
+    size_t last_frame_idx_update = all_frames.size() - 1;
+    all_frames[last_frame_idx_update]->SetTwb(ParamsToPose(pose_params[last_frame_idx_update].data()));
     
     // Debug: print poses after BA
     LOG_INFO("  After BA poses:");
@@ -663,14 +614,16 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         Eigen::Vector3f pos = T.block<3,1>(0,3);
         LOG_INFO("    Frame {}: pos=({:.4f},{:.4f},{:.4f}){}", 
                  window_frames[i]->GetFrameId(), pos.x(), pos.y(), pos.z(),
-                 i < num_to_fix ? " [FIXED]" : "");
+                 i != last_frame_idx_update ? " [FIXED]" : " [OPTIMIZED]");
     }
     
-    // Update MapPoints (skip fixed ones - they define scale)
+    // Update MapPoints that were optimized (not fixed)
+    int mp_updated = 0;
     for (size_t i = 0; i < mappoints.size(); ++i) {
-        if (!mappoints[i]->IsBad() && !mappoints[i]->IsFixed()) {
-            Eigen::Vector3f pos(point_params[i][0], point_params[i][1], point_params[i][2]);
-            mappoints[i]->SetPosition(pos);
+        if (!mappoints[i]->IsFixed()) {
+            Eigen::Vector3f new_pos(point_params[i][0], point_params[i][1], point_params[i][2]);
+            mappoints[i]->SetPosition(new_pos);
+            mp_updated++;
         }
     }
     
