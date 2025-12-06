@@ -24,6 +24,7 @@ namespace vio_360 {
 class Frame;
 class MapPoint;
 class Camera;
+struct IMUPreintegration;
 
 /**
  * @brief PnP optimization result
@@ -58,6 +59,29 @@ struct BAResult {
     BAResult() : success(false), num_inliers(0), num_outliers(0),
                  num_poses_optimized(0), num_points_optimized(0),
                  initial_cost(0.0), final_cost(0.0), num_iterations(0) {}
+};
+
+/**
+ * @brief IMU Initialization result
+ */
+struct IMUInitResult {
+    bool success;
+    Eigen::Vector3f gravity;              // Estimated gravity direction in world frame (before transform)
+    Eigen::Matrix3f Rwg;                   // Rotation from world to gravity-aligned frame
+    double scale;                          // Estimated scale (monocular)
+    std::vector<Eigen::Vector3f> velocities; // Estimated velocities for each frame (before transform)
+    Eigen::Vector3f gyro_bias;             // Estimated gyro bias
+    Eigen::Vector3f accel_bias;            // Estimated accel bias
+    double initial_cost;
+    double final_cost;
+    
+    IMUInitResult() : success(false), 
+                      gravity(Eigen::Vector3f(0, 0, -9.81)),
+                      Rwg(Eigen::Matrix3f::Identity()),
+                      scale(1.0),
+                      gyro_bias(Eigen::Vector3f::Zero()),
+                      accel_bias(Eigen::Vector3f::Zero()),
+                      initial_cost(0.0), final_cost(0.0) {}
 };
 
 /**
@@ -122,6 +146,35 @@ public:
      * @return BA optimization result
      */
     BAResult RunFullBA(const std::vector<std::shared_ptr<Frame>>& frames);
+    
+    /**
+     * @brief Run Visual-Inertial Bundle Adjustment
+     * 
+     * Optimizes poses, velocities, and biases using both visual and IMU constraints.
+     * Gravity direction is fixed (assumed already aligned after IMU initialization).
+     * 
+     * @param frames Vector of keyframes with IMU preintegration
+     * @param gravity Gravity vector in world frame (after alignment, typically [0,0,-9.81])
+     * @param fix_first_pose If true, first frame's pose is fixed
+     * @return BA optimization result
+     */
+    BAResult RunVIBA(const std::vector<std::shared_ptr<Frame>>& frames,
+                     const Eigen::Vector3f& gravity,
+                     bool fix_first_pose = true);
+    
+    // ============ IMU Initialization ============
+    
+    /**
+     * @brief Initialize IMU by estimating gravity direction, scale, velocities, and biases
+     * 
+     * Uses 2-stage optimization:
+     * - Stage 1: Optimize gravity direction and scale (fix poses, velocities, biases)
+     * - Stage 2: Optimize velocities and biases (fix gravity direction and scale)
+     * 
+     * @param frames Vector of keyframes with IMU preintegration
+     * @return IMU initialization result
+     */
+    IMUInitResult OptimizeIMUInit(const std::vector<std::shared_ptr<Frame>>& frames);
 
 private:
     /**

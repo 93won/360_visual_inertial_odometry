@@ -477,6 +477,45 @@ private:
     Eigen::MatrixXd information_;
 };
 
+/**
+ * @brief Inertial factor with fixed gravity for Visual-Inertial BA
+ * 
+ * Used after IMU initialization when gravity direction is known and fixed.
+ * Optimizes poses and velocities while keeping gravity constant.
+ * 
+ * Residual: [rotation_error(3), velocity_error(3), position_error(3)] = 9D
+ * Parameters: pose_i[6], velocity_i[3], gyro_bias[3], accel_bias[3], pose_j[6], velocity_j[3]
+ */
+class InertialFactorFixedGravity : public ceres::SizedCostFunction<9, 6, 3, 3, 3, 6, 3> {
+public:
+    /**
+     * @brief Constructor
+     * @param preintegration IMU preintegration data
+     * @param gravity Fixed gravity vector in world frame (after alignment)
+     * @param T_wb_i_init Initial pose of frame i for right perturbation
+     * @param T_wb_j_init Initial pose of frame j for right perturbation
+     */
+    InertialFactorFixedGravity(std::shared_ptr<IMUPreintegration> preintegration,
+                               const Eigen::Vector3d& gravity,
+                               const Eigen::Matrix4d& T_wb_i_init,
+                               const Eigen::Matrix4d& T_wb_j_init);
+
+    virtual bool Evaluate(double const* const* parameters,
+                         double* residuals,
+                         double** jacobians) const override;
+
+private:
+    std::shared_ptr<IMUPreintegration> m_preintegration;
+    Eigen::Vector3d m_gravity;
+    Eigen::Matrix4d m_T_wb_i_init;
+    Eigen::Matrix4d m_T_wb_j_init;
+    Eigen::Matrix<double, 9, 9> m_sqrt_information;
+
+    Eigen::Matrix3d skew_symmetric(const Eigen::Vector3d& v) const;
+    Eigen::Matrix3d right_jacobian_SO3(const Eigen::Vector3d& phi) const;
+    Eigen::Vector3d log_SO3(const Eigen::Matrix3d& R) const;
+};
+
 
 } // namespace factor
 } // namespace vio_360

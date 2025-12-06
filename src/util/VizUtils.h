@@ -172,6 +172,13 @@ private:
      * @brief Draw coordinate axis
      */
     void DrawAxis(float size = 1.0f);
+    
+    /**
+     * @brief Draw XY grid on Z=0 plane
+     * @param size Grid extent (-size to +size)
+     * @param spacing Space between grid lines
+     */
+    void DrawGrid(float size = 10.0f, float spacing = 1.0f);
 };
 
 } // namespace vio_360

@@ -174,23 +174,32 @@ bool Initializer::TryMonocularInitialization(
     Eigen::Matrix4f T_BC = frame1->GetTBC();  // camera-to-body (c → b)
     Eigen::Matrix4f T_CB = T_BC.inverse();    // body-to-camera (b → c)
     
-    // Camera1 is at world origin: T_wc1 = Identity
-    // Body1 pose: T_wb1 = T_wc1 * T_cb = T_cb
-    Eigen::Matrix4f T_wc1 = Eigen::Matrix4f::Identity();
-    Eigen::Matrix4f T_wb1 = T_wc1 * T_CB;
+    // Debug: Print T_BC to verify it's loaded correctly
+    LOG_INFO("T_BC (camera→body):");
+    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(0,0), T_BC(0,1), T_BC(0,2), T_BC(0,3));
+    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(1,0), T_BC(1,1), T_BC(1,2), T_BC(1,3));
+    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(2,0), T_BC(2,1), T_BC(2,2), T_BC(2,3));
+    LOG_INFO("  [{:.4f}, {:.4f}, {:.4f}, {:.4f}]", T_BC(3,0), T_BC(3,1), T_BC(3,2), T_BC(3,3));
+    
+    // World frame = Body1 frame (body1 is at world origin)
+    // T_wb1 = Identity
+    Eigen::Matrix4f T_wb1 = Eigen::Matrix4f::Identity();
     frame1->SetTwb(T_wb1);
     frame1->SetKeyframe(true);
     
-    // T_c1c2 = [R | t]: camera1 to camera2 transformation
-    // T_wc2 = T_wc1 * T_c1c2^(-1) = T_c2c1 (since T_wc1 = I)
-    // Actually: T_c1c2 transforms cam1 coords to cam2 coords
-    // So T_wc2 (cam2 pose in world) = T_c1c2^(-1) when world = cam1
+    // T_wc1 = T_wb1 * T_BC = T_BC (camera1 pose in world)
+    Eigen::Matrix4f T_wc1 = T_wb1 * T_BC;
+    
+    // T_c1c2 = [R | t]: transforms points from camera1 to camera2 frame
+    // T_c2c1 = T_c1c2^(-1): transforms points from camera2 to camera1 frame
+    // Camera2 pose in world: T_wc2 = T_wc1 * T_c2c1
     Eigen::Matrix4f T_c1c2 = Eigen::Matrix4f::Identity();
     T_c1c2.block<3, 3>(0, 0) = R;
     T_c1c2.block<3, 1>(0, 3) = t;
-    Eigen::Matrix4f T_wc2 = T_c1c2.inverse();
+    Eigen::Matrix4f T_c2c1 = T_c1c2.inverse();
+    Eigen::Matrix4f T_wc2 = T_wc1 * T_c2c1;
     
-    // Convert camera2 pose to body2 pose: T_wb2 = T_wc2 * T_cb
+    // Convert camera2 pose to body2 pose: T_wb2 = T_wc2 * T_CB
     Eigen::Matrix4f T_wb2 = T_wc2 * T_CB;
     frame2->SetTwb(T_wb2);
     frame2->SetKeyframe(true);
@@ -205,8 +214,14 @@ bool Initializer::TryMonocularInitialization(
                  C1.x(), C1.y(), C1.z(), C2.x(), C2.y(), C2.z(), (C1-C2).norm());
     }
     
-    // 10. Transform points to world frame (frame1 = world origin)
-    // points3d are already in frame1 coordinates = world coordinates
+    // 10. Transform points from camera1 frame to world (=body1) frame
+    // points3d are in camera1 coordinates, need to transform to world
+    // p_world = T_wc1 * p_c1 = T_BC * p_c1 (since T_wb1 = I)
+    Eigen::Matrix3f R_wc1 = T_wc1.block<3, 3>(0, 0);
+    Eigen::Vector3f t_wc1 = T_wc1.block<3, 1>(0, 3);
+    for (auto& pt : points3d) {
+        pt = R_wc1 * pt + t_wc1;
+    }
     
     // 11. Create MapPoints and register to frames
     CreateMapPoints(frame1, frame2, points3d, selected_features, result);
@@ -1017,8 +1032,8 @@ float Initializer::NormalizeScale(
         median_depth = depths[mid];
     }
     
-    // Scale factor to normalize median depth to 10.0 (reasonable scene scale)
-    const float target_median_depth = 10.0f;
+    // Scale factor to normalize median depth to 1.0 (unit scale for IMU initialization)
+    const float target_median_depth = 1.0f;
     float scale_factor = target_median_depth / median_depth;
     
     // Scale all 3D points

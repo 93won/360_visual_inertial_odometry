@@ -27,8 +27,13 @@ namespace vio_360 {
 Estimator::Estimator()
     : m_frame_id_counter(0)
     , m_initialized(false)
+    , m_imu_initialized(false)
     , m_current_pose(Eigen::Matrix4f::Identity())
-    , m_transform_from_last(Eigen::Matrix4f::Identity()) {
+    , m_transform_from_last(Eigen::Matrix4f::Identity())
+    , m_gravity(0, 0, -9.81f)
+    , m_gyro_bias(Eigen::Vector3f::Zero())
+    , m_accel_bias(Eigen::Vector3f::Zero())
+    , m_scale(1.0) {
     
     // Initialize camera
     const auto& config = ConfigUtils::GetInstance();
@@ -107,6 +112,28 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
                 first_frame->SetKeyframe(true);
                 last_frame->SetKeyframe(true);
                 
+                // Compute preintegration from first_frame to last_frame for IMU init
+                if (!m_imu_since_last_keyframe.empty()) {
+                    Eigen::Vector3f gyro_bias = first_frame->GetGyroBias();
+                    Eigen::Vector3f accel_bias = first_frame->GetAccelBias();
+                    m_imu_preintegrator->SetBias(gyro_bias, accel_bias);
+                    
+                    double start_time = m_imu_since_last_keyframe.front().timestamp;
+                    double end_time = m_imu_since_last_keyframe.back().timestamp;
+                    
+                    auto preint_from_first_kf = m_imu_preintegrator->Preintegrate(
+                        m_imu_since_last_keyframe, start_time, end_time
+                    );
+                    
+                    if (preint_from_first_kf) {
+                        last_frame->SetIMUPreintegrationFromLastKeyframe(preint_from_first_kf);
+                        LOG_INFO("  IMU preintegration: kf {} -> kf {}: dt={:.3f}s, {} samples",
+                                 first_frame->GetFrameId(), last_frame->GetFrameId(),
+                                 preint_from_first_kf->dt_total, m_imu_since_last_keyframe.size());
+                    }
+                    m_imu_since_last_keyframe.clear();
+                }
+                
                 m_keyframes.push_back(first_frame);
                 m_keyframes.push_back(last_frame);
                 m_last_keyframe = last_frame;
@@ -143,8 +170,14 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             }
         }
         
-        // Always initialize pose from previous frame (for tracking continuity)
-        m_current_frame->SetTwb(m_previous_frame->GetTwb());
+        // Initialize pose: use IMU prediction if available, otherwise use previous pose
+        bool imu_predicted = false;
+        if (m_imu_initialized) {
+            imu_predicted = PredictStateWithIMU();
+        }
+        if (!imu_predicted) {
+            m_current_frame->SetTwb(m_previous_frame->GetTwb());
+        }
         
         // Pose estimation using PnP
         if (valid_mp_count >= 6) {
@@ -244,29 +277,14 @@ Estimator::EstimationResult Estimator::ProcessFrame(
                 result.init_success = true;
                 m_initialized = true;
                 
-                // Set initialization keyframes
-                auto first_frame = m_frame_window.front();
-                auto last_frame = m_frame_window.back();
+                // Process all frames in window: interpolate poses, run PnP, BA, compute preintegration
+                // This creates keyframes for ALL frames in the window (not just first and last)
+                ProcessIntermediateFrames();
                 
-                first_frame->SetKeyframe(true);
-                last_frame->SetKeyframe(true);
-                
-                m_keyframes.push_back(first_frame);
-                m_keyframes.push_back(last_frame);
-                m_all_keyframes.push_back(first_frame);
-                m_all_keyframes.push_back(last_frame);
-                m_last_keyframe = last_frame;
-                
-                LOG_DEBUG("Set keyframes: {} and {} (last_keyframe={})", 
-                         first_frame->GetFrameId(), last_frame->GetFrameId(), 
-                         m_last_keyframe->GetFrameId());
-                
-                // Note: We only use the first and last frames as keyframes from initialization.
-                // Intermediate frames are not added as keyframes (they don't have triangulated points).
-                // The sliding window will naturally grow as new keyframes are created.
-                
-                // OLD: Process intermediate frames: interpolate poses, link MapPoints, run PnP
-                // ProcessIntermediateFrames();  // Commented out - not useful for now
+                // Now run IMU initialization with all 10 keyframes
+                if (!m_imu_initialized && m_keyframes.size() >= 3) {
+                    TryInitializeIMU();
+                }
             } else {
                 if (m_frame_window.size() >= 2) {
                     auto first_frame = m_frame_window.front();
@@ -297,15 +315,22 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             }
         }
         
-        // Initialize pose using constant velocity motion model
-        // T_current = T_prev * delta_T, where delta_T = T_{prev-1}^{-1} * T_prev
-        if (m_transform_from_last.isIdentity(1e-6)) {
-            // First frame after initialization, use previous pose
-            m_current_frame->SetTwb(m_previous_frame->GetTwb());
-        } else {
-            // Apply motion model: predict current pose from velocity
-            Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
-            m_current_frame->SetTwb(predicted_pose);
+        // Initialize pose: use IMU prediction if available, otherwise constant velocity model
+        bool imu_predicted = false;
+        if (m_imu_initialized) {
+            imu_predicted = PredictStateWithIMU();
+        }
+        
+        if (!imu_predicted) {
+            // Fallback to constant velocity motion model
+            if (m_transform_from_last.isIdentity(1e-6)) {
+                // First frame after initialization, use previous pose
+                m_current_frame->SetTwb(m_previous_frame->GetTwb());
+            } else {
+                // Apply motion model: predict current pose from velocity
+                Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
+                m_current_frame->SetTwb(predicted_pose);
+            }
         }
         
         // Pose estimation using PnP
@@ -399,6 +424,50 @@ void Estimator::ProcessIMU(const std::vector<IMUData>& imu_data) {
         imu_data.begin(),
         imu_data.end()
     );
+}
+
+bool Estimator::PredictStateWithIMU() {
+    if (!m_imu_initialized || !m_current_frame || !m_previous_frame) {
+        return false;
+    }
+    
+    // Get IMU preintegration from last frame
+    auto preint = m_current_frame->GetIMUPreintegrationFromLastFrame();
+    if (!preint || !preint->IsValid()) {
+        return false;
+    }
+    
+    // Get previous frame state
+    Eigen::Matrix4f T_wb_prev = m_previous_frame->GetTwb();
+    Eigen::Matrix3f R_wb_prev = T_wb_prev.block<3, 3>(0, 0);
+    Eigen::Vector3f t_wb_prev = T_wb_prev.block<3, 1>(0, 3);
+    Eigen::Vector3f v_prev = m_previous_frame->GetVelocity();
+    
+    // Get preintegration values
+    float dt = static_cast<float>(preint->dt_total);
+    Eigen::Matrix3f delta_R = preint->delta_R;
+    Eigen::Vector3f delta_V = preint->delta_V;
+    Eigen::Vector3f delta_P = preint->delta_P;
+    
+    // Predict current state using IMU preintegration
+    // R_new = R_prev * delta_R
+    Eigen::Matrix3f R_wb_curr = R_wb_prev * delta_R;
+    
+    // V_new = V_prev + g * dt + R_prev * delta_V
+    Eigen::Vector3f v_curr = v_prev + m_gravity * dt + R_wb_prev * delta_V;
+    
+    // P_new = P_prev + V_prev * dt + 0.5 * g * dt^2 + R_prev * delta_P
+    Eigen::Vector3f t_wb_curr = t_wb_prev + v_prev * dt + 0.5f * m_gravity * dt * dt + R_wb_prev * delta_P;
+    
+    // Set predicted state
+    Eigen::Matrix4f T_wb_curr = Eigen::Matrix4f::Identity();
+    T_wb_curr.block<3, 3>(0, 0) = R_wb_curr;
+    T_wb_curr.block<3, 1>(0, 3) = t_wb_curr;
+    
+    m_current_frame->SetTwb(T_wb_curr);
+    m_current_frame->SetVelocity(v_curr);
+    
+    return true;
 }
 
 bool Estimator::TryInitialize() {
@@ -506,6 +575,15 @@ std::shared_ptr<Frame> Estimator::CreateFrame(const cv::Mat& image, double times
         config.max_features_per_grid
     );
     
+    // Set camera-to-body extrinsic transformation
+    frame->SetTBC(config.T_BC);
+    
+    // Copy bias from previous frame (after IMU initialization)
+    if (m_imu_initialized && m_previous_frame) {
+        frame->SetGyroBias(m_previous_frame->GetGyroBias());
+        frame->SetAccelBias(m_previous_frame->GetAccelBias());
+    }
+    
     return frame;
 }
 
@@ -563,6 +641,32 @@ void Estimator::CreateKeyframe() {
     
     // Get previous keyframe before updating m_last_keyframe
     auto prev_keyframe = m_last_keyframe;
+    
+    // Compute and store preintegration from last keyframe BEFORE updating m_last_keyframe
+    if (prev_keyframe && !m_imu_since_last_keyframe.empty()) {
+        // Get bias from previous keyframe
+        Eigen::Vector3f gyro_bias = prev_keyframe->GetGyroBias();
+        Eigen::Vector3f accel_bias = prev_keyframe->GetAccelBias();
+        m_imu_preintegrator->SetBias(gyro_bias, accel_bias);
+        
+        // Compute preintegration from accumulated IMU data
+        double start_time = m_imu_since_last_keyframe.front().timestamp;
+        double end_time = m_imu_since_last_keyframe.back().timestamp;
+        
+        auto preint_from_last_kf = m_imu_preintegrator->Preintegrate(
+            m_imu_since_last_keyframe, start_time, end_time
+        );
+        
+        if (preint_from_last_kf) {
+            m_current_frame->SetIMUPreintegrationFromLastKeyframe(preint_from_last_kf);
+            LOG_DEBUG("  IMU: preintegration from kf {} to kf {}: dt={:.3f}s, {} measurements",
+                     prev_keyframe->GetFrameId(), m_current_frame->GetFrameId(),
+                     preint_from_last_kf->dt_total, m_imu_since_last_keyframe.size());
+        }
+    }
+    
+    // Clear accumulated IMU data for next keyframe
+    m_imu_since_last_keyframe.clear();
     
     // Mark current frame as keyframe
     m_current_frame->SetKeyframe(true);
@@ -655,14 +759,35 @@ void Estimator::CreateKeyframe() {
         new_points = TriangulateNewMapPoints(prev_keyframe, m_current_frame);
     }
     
-    // Run local BA if we have new MapPoints
+    // Run BA if we have new MapPoints
     if (new_points > 0 && m_keyframes.size() >= 2) {
         Optimizer optimizer;
         optimizer.SetCamera(m_camera, m_boundary_margin);
-        BAResult ba_result = optimizer.RunLocalBA(m_keyframes);  // Sliding window BA
-        LOG_INFO("LocalBA: {} in/{} out, cost {:.2f}->{:.2f}", 
-                 ba_result.num_inliers, ba_result.num_outliers,
-                 ba_result.initial_cost, ba_result.final_cost);
+        
+        BAResult ba_result;
+        if (m_imu_initialized) {
+            // Visual-only BA for now (VIBA disabled for debugging)
+            ba_result = optimizer.RunLocalBA(m_keyframes);
+            
+            // // Visual-Inertial BA after IMU initialization
+            // ba_result = optimizer.RunVIBA(m_keyframes, m_gravity, true);
+            
+            // // Get updated bias from last keyframe
+            // auto last_kf = m_keyframes.back();
+            // Eigen::Vector3f new_gyro_bias = last_kf->GetGyroBias();
+            // Eigen::Vector3f new_accel_bias = last_kf->GetAccelBias();
+            
+            // LOG_INFO("VIBA KF{}: bg=[{:.6f},{:.6f},{:.6f}] ba=[{:.6f},{:.6f},{:.6f}]",
+            //          last_kf->GetFrameId(),
+            //          new_gyro_bias.x(), new_gyro_bias.y(), new_gyro_bias.z(),
+            //          new_accel_bias.x(), new_accel_bias.y(), new_accel_bias.z());
+            
+            // // Update all preintegrations with new bias
+            // UpdatePreintegrationsWithNewBias(new_gyro_bias, new_accel_bias);
+        } else {
+            // Visual-only Local BA before IMU initialization
+            ba_result = optimizer.RunLocalBA(m_keyframes);
+        }
         
         // Update m_current_pose with BA-optimized pose
         m_current_pose = m_current_frame->GetTwb();
@@ -670,6 +795,11 @@ void Estimator::CreateKeyframe() {
         // Reset m_transform_from_last to identity after BA
         // Next frame will start from the BA-optimized keyframe pose
         m_transform_from_last = Eigen::Matrix4f::Identity();
+    }
+    
+    // Try IMU initialization after VO is initialized and we have enough keyframes
+    if (m_initialized && !m_imu_initialized && m_keyframes.size() >= 3) {
+        TryInitializeIMU();
     }
 }
 
@@ -737,12 +867,38 @@ void Estimator::ProcessIntermediateFrames() {
     
     int n_frames = static_cast<int>(m_frame_window.size());
     
-    LOG_DEBUG("Processing {} intermediate frames...", n_frames - 2);
+    LOG_DEBUG("Processing {} intermediate frames to create keyframes...", n_frames - 2);
     
-    // Process intermediate frames (skip first and last which are keyframes)
+    // Build global feature ID to MapPoint map from first_kf and last_kf (the two frames with triangulated MapPoints)
+    std::unordered_map<int, std::shared_ptr<MapPoint>> feature_to_mappoint;
+    
+    // Collect from first keyframe
+    const auto& first_features = first_kf->GetFeatures();
+    for (size_t j = 0; j < first_features.size(); ++j) {
+        auto mp = first_kf->GetMapPoint(static_cast<int>(j));
+        if (mp && !mp->IsBad()) {
+            feature_to_mappoint[first_features[j]->GetFeatureId()] = mp;
+        }
+    }
+    
+    // Collect from last keyframe (may add new MapPoints or override)
+    const auto& last_features = last_kf->GetFeatures();
+    for (size_t j = 0; j < last_features.size(); ++j) {
+        auto mp = last_kf->GetMapPoint(static_cast<int>(j));
+        if (mp && !mp->IsBad()) {
+            int feat_id = last_features[j]->GetFeatureId();
+            if (feature_to_mappoint.find(feat_id) == feature_to_mappoint.end()) {
+                feature_to_mappoint[feat_id] = mp;
+            }
+        }
+    }
+    
+    LOG_DEBUG("Found {} unique MapPoints from first/last keyframes for observation propagation", 
+             feature_to_mappoint.size());
+    
+    // Process intermediate frames (skip first and last which already have poses)
     for (int i = 1; i < n_frames - 1; ++i) {
         auto& frame = m_frame_window[i];
-        auto& prev_frame = m_frame_window[i - 1];
         
         // Interpolate pose (linear interpolation for translation, slerp for rotation)
         float alpha = static_cast<float>(i) / static_cast<float>(n_frames - 1);
@@ -760,56 +916,106 @@ void Estimator::ProcessIntermediateFrames() {
         T_interp.block<3, 1>(0, 3) = t_interp;
         frame->SetTwb(T_interp);
         
-        // Link MapPoints from previous frame
+        // Link MapPoints from global feature->mappoint map (matches feature IDs across all triangulated points)
         const auto& curr_features = frame->GetFeatures();
-        const auto& prev_features = prev_frame->GetFeatures();
-        
-        std::unordered_map<int, size_t> prev_feature_map;
-        for (size_t j = 0; j < prev_features.size(); ++j) {
-            prev_feature_map[prev_features[j]->GetFeatureId()] = j;
-        }
         
         int linked = 0;
         for (size_t j = 0; j < curr_features.size(); ++j) {
             int feat_id = curr_features[j]->GetFeatureId();
-            auto it = prev_feature_map.find(feat_id);
-            if (it != prev_feature_map.end()) {
-                auto mp = prev_frame->GetMapPoint(static_cast<int>(it->second));
+            auto it = feature_to_mappoint.find(feat_id);
+            if (it != feature_to_mappoint.end()) {
+                auto mp = it->second;
                 if (mp && !mp->IsBad()) {
                     frame->SetMapPoint(static_cast<int>(j), mp);
+                    mp->AddObservation(frame, static_cast<int>(j));
                     linked++;
                 }
             }
         }
+        
+        LOG_INFO("  Frame {} (idx {}): linked {} MapPoints", frame->GetFrameId(), i, linked);
         
         // Run PnP to refine pose
         if (linked >= 6) {
             Optimizer optimizer;
             optimizer.SetCamera(m_camera, m_boundary_margin);
             PnPResult pnp_result = optimizer.SolvePnP(frame);
-            LOG_DEBUG("  Frame {}: interpolated -> PnP {} in/{} out, reproj {:.2f}px",
+            LOG_INFO("  Frame {} PnP: {} inliers, {} outliers, reproj={:.2f}px",
                      frame->GetFrameId(), pnp_result.num_inliers, pnp_result.num_outliers,
                      pnp_result.final_cost);
+        } else {
+            LOG_WARN("  Frame {} (idx {}): only {} linked points, skipping PnP", 
+                    frame->GetFrameId(), i, linked);
         }
     }
     
-    // Run BA on all frames in window
-    LOG_DEBUG("Running BA on {} frames in initialization window...", n_frames);
+    // Run BA on all frames in window (first frame fixed, last frame NOT fixed)
+    LOG_INFO("Running BA on {} frames with all MapPoints...", n_frames);
     Optimizer optimizer;
     optimizer.SetCamera(m_camera, m_boundary_margin);
     BAResult ba_result = optimizer.RunBA(m_frame_window, true, false);
-    LOG_DEBUG("Init window BA done: {} inliers, {} outliers", 
-             ba_result.num_inliers, ba_result.num_outliers);
+    LOG_INFO("Init window BA: {} inliers, {} outliers, cost {:.2f} -> {:.2f}",
+             ba_result.num_inliers, ba_result.num_outliers,
+             ba_result.initial_cost, ba_result.final_cost);
     
-    // Mark all intermediate frames as keyframes and add to keyframe list
-    for (int i = 1; i < n_frames - 1; ++i) {
+    // Mark all frames as keyframes
+    for (int i = 0; i < n_frames; ++i) {
         auto& frame = m_frame_window[i];
         frame->SetKeyframe(true);
-        // Insert in order (after first keyframe, before last keyframe)
-        m_keyframes.insert(m_keyframes.end() - 1, frame);
     }
-    LOG_DEBUG("Added {} intermediate frames as keyframes (total: {})", 
-             n_frames - 2, m_keyframes.size());
+    
+    // Use preintegration from last frame (already computed per-frame during tracking)
+    // In init phase, each frame has preintegration from previous frame
+    // For keyframes: just copy frame-to-frame preintegration as keyframe-to-keyframe
+    LOG_INFO("Setting up IMU preintegration for {} keyframe pairs...", n_frames - 1);
+    int valid_preint_count = 0;
+    for (int i = 1; i < n_frames; ++i) {
+        auto& curr_kf = m_frame_window[i];
+        
+        // Get preintegration from last frame (which is also the previous keyframe in init phase)
+        auto preint = curr_kf->GetIMUPreintegrationFromLastFrame();
+        if (preint) {
+            curr_kf->SetIMUPreintegrationFromLastKeyframe(preint);
+            valid_preint_count++;
+            LOG_INFO("  IMU preint[{}]: kf{} -> kf{}: dt={:.3f}s, dV=({:.3f},{:.3f},{:.3f})",
+                     i-1, m_frame_window[i-1]->GetFrameId(), curr_kf->GetFrameId(),
+                     preint->dt_total,
+                     preint->delta_V.x(), preint->delta_V.y(), preint->delta_V.z());
+        } else {
+            LOG_WARN("  No preintegration for kf{} -> kf{}",
+                    m_frame_window[i-1]->GetFrameId(), curr_kf->GetFrameId());
+        }
+    }
+    LOG_INFO("IMU preintegration: {}/{} pairs ready", valid_preint_count, n_frames - 1);
+    
+    // Clear accumulated IMU data (not needed anymore for init)
+    m_imu_since_last_keyframe.clear();
+    
+    // Add all keyframes to the list (first and last already added in caller)
+    // Clear existing and re-add all in order
+    m_keyframes.clear();
+    m_all_keyframes.clear();
+    for (int i = 0; i < n_frames; ++i) {
+        m_keyframes.push_back(m_frame_window[i]);
+        m_all_keyframes.push_back(m_frame_window[i]);
+    }
+    m_last_keyframe = m_frame_window.back();
+    
+    // Log MapPoint count for each keyframe
+    for (int i = 0; i < n_frames; ++i) {
+        auto& kf = m_frame_window[i];
+        int mp_count = 0;
+        size_t n_features = kf->GetFeatureCount();
+        for (size_t j = 0; j < n_features; ++j) {
+            auto mp = kf->GetMapPoint(j);
+            if (mp && !mp->IsBad()) {
+                mp_count++;
+            }
+        }
+        LOG_INFO("KF[{}] frame_id={}: {} MapPoints (features={})", i, kf->GetFrameId(), mp_count, n_features);
+    }
+    
+    LOG_INFO("Created {} keyframes from initialization window", n_frames);
 }
 
 float Estimator::ComputeParallax(
@@ -1109,6 +1315,245 @@ int Estimator::TriangulateNewMapPoints(
              matched_count, already_has_mp, depth_failed, reproj_failed, triangulated_count);
     
     return triangulated_count;
+}
+
+bool Estimator::TryInitializeIMU() {
+    // Already initialized?
+    if (m_imu_initialized) {
+        return true;
+    }
+    
+    // Need at least 3 keyframes for IMU initialization
+    if (m_keyframes.size() < 3) {
+        LOG_INFO("[IMU_INIT] Waiting for more keyframes: {}/3", m_keyframes.size());
+        return false;
+    }
+    
+    // Check if all keyframes have preintegration (except first)
+    bool all_have_preint = true;
+    for (size_t i = 1; i < m_keyframes.size(); ++i) {
+        if (!m_keyframes[i]->HasIMUPreintegrationFromLastKeyframe()) {
+            LOG_INFO("[IMU_INIT] Keyframe {} missing preintegration", i);
+            all_have_preint = false;
+            break;
+        }
+    }
+    
+    if (!all_have_preint) {
+        LOG_INFO("[IMU_INIT] Not all keyframes have preintegration");
+        return false;
+    }
+    
+    LOG_INFO("[IMU_INIT] Starting IMU initialization with {} keyframes", m_keyframes.size());
+    
+    // Run 2-stage IMU optimization (gravity + scale + velocities + biases)
+    Optimizer optimizer;
+    auto result = optimizer.OptimizeIMUInit(m_keyframes);
+    
+    if (!result.success) {
+        LOG_WARN("[IMU_INIT] IMU initialization failed");
+        return false;
+    }
+    
+    // Store results
+    m_gravity = result.gravity;
+    m_scale = result.scale;
+    m_gyro_bias = result.gyro_bias;
+    m_accel_bias = result.accel_bias;
+    
+    // Update velocities and biases in keyframes (before transformation)
+    for (size_t i = 0; i < m_keyframes.size() && i < result.velocities.size(); ++i) {
+        m_keyframes[i]->SetVelocity(result.velocities[i]);
+        m_keyframes[i]->SetGyroBias(m_gyro_bias);
+        m_keyframes[i]->SetAccelBias(m_accel_bias);
+    }
+    
+    // Update biases in preintegrator
+    m_imu_preintegrator->SetBias(m_gyro_bias, m_accel_bias);
+    
+    // Update current frame bias if exists
+    if (m_current_frame) {
+        m_current_frame->SetGyroBias(m_gyro_bias);
+        m_current_frame->SetAccelBias(m_accel_bias);
+    }
+    
+    LOG_INFO("[IMU_INIT] IMU initialization SUCCESS!");
+    LOG_INFO("  Gravity (before transform): [{:.4f}, {:.4f}, {:.4f}] (norm={:.4f})",
+             m_gravity.x(), m_gravity.y(), m_gravity.z(), m_gravity.norm());
+    LOG_INFO("  Scale: {:.4f}", m_scale);
+    LOG_INFO("  Gyro bias: [{:.6f}, {:.6f}, {:.6f}]",
+             m_gyro_bias.x(), m_gyro_bias.y(), m_gyro_bias.z());
+    LOG_INFO("  Accel bias: [{:.6f}, {:.6f}, {:.6f}]",
+             m_accel_bias.x(), m_accel_bias.y(), m_accel_bias.z());
+    
+    // Apply gravity alignment transformation to world coordinate system
+    // This transforms all poses, MapPoints, and velocities so gravity points in -Z
+    ApplyGravityAlignmentTransform(result.Rwg, static_cast<float>(result.scale));
+    
+    // Update gravity to point in -Z direction (after transformation)
+    m_gravity = Eigen::Vector3f(0.0f, 0.0f, -9.81f);
+    
+    m_imu_initialized = true;
+    
+    return true;
+}
+
+void Estimator::UpdatePreintegrationsWithNewBias(const Eigen::Vector3f& new_gyro_bias,
+                                                  const Eigen::Vector3f& new_accel_bias) {
+    // Update preintegrations in all keyframes
+    for (auto& kf : m_keyframes) {
+        auto preint = kf->GetIMUPreintegrationFromLastKeyframe();
+        if (preint && preint->IsValid()) {
+            m_imu_preintegrator->UpdatePreintegrationWithNewBias(preint, new_gyro_bias, new_accel_bias);
+        }
+        
+        auto preint_frame = kf->GetIMUPreintegrationFromLastFrame();
+        if (preint_frame && preint_frame->IsValid()) {
+            m_imu_preintegrator->UpdatePreintegrationWithNewBias(preint_frame, new_gyro_bias, new_accel_bias);
+        }
+        
+        // Update bias in frame
+        kf->SetGyroBias(new_gyro_bias);
+        kf->SetAccelBias(new_accel_bias);
+    }
+    
+    // Update current frame if exists
+    if (m_current_frame) {
+        auto preint_frame = m_current_frame->GetIMUPreintegrationFromLastFrame();
+        if (preint_frame && preint_frame->IsValid()) {
+            m_imu_preintegrator->UpdatePreintegrationWithNewBias(preint_frame, new_gyro_bias, new_accel_bias);
+        }
+        m_current_frame->SetGyroBias(new_gyro_bias);
+        m_current_frame->SetAccelBias(new_accel_bias);
+    }
+    
+    // Update estimator's bias
+    m_gyro_bias = new_gyro_bias;
+    m_accel_bias = new_accel_bias;
+    m_imu_preintegrator->SetBias(new_gyro_bias, new_accel_bias);
+}
+
+void Estimator::ApplyGravityAlignmentTransform(const Eigen::Matrix3f& Rwg, float optimized_scale) {
+    // Tgw transforms from old world to gravity-aligned world
+    // Rgw = Rwg^T (Rwg is world-to-gravity, we need gravity-to-world for inverse)
+    Eigen::Matrix3f Rgw = Rwg.transpose();
+    
+    // Scale factor: optimized_scale means "VO * s = metric"
+    // So to convert VO to metric, we apply 1/s
+    float scale_factor = 1.0f / optimized_scale;
+    
+    // 1. Collect all unique MapPoints from keyframes
+    std::set<std::shared_ptr<MapPoint>> unique_mps;
+    for (const auto& kf : m_keyframes) {
+        const auto& features = kf->GetFeatures();
+        for (size_t i = 0; i < features.size(); ++i) {
+            auto mp = kf->GetMapPoint(static_cast<int>(i));
+            if (mp && !mp->IsBad()) {
+                unique_mps.insert(mp);
+            }
+        }
+    }
+    
+    // =========================================================================
+    // STEP 1: Apply gravity alignment (rotation only)
+    // =========================================================================
+    
+    // Transform MapPoints: p_new = Rgw * p_old
+    for (const auto& mp : unique_mps) {
+        Eigen::Vector3f pos_old = mp->GetPosition();
+        Eigen::Vector3f pos_new = Rgw * pos_old;
+        mp->SetPosition(pos_new);
+    }
+    
+    // Transform keyframe poses: R_new = Rgw * R_old, t_new = Rgw * t_old
+    for (const auto& kf : m_keyframes) {
+        Eigen::Matrix4f Twb_old = kf->GetTwb();
+        Eigen::Matrix3f R_old = Twb_old.block<3,3>(0,0);
+        Eigen::Vector3f t_old = Twb_old.block<3,1>(0,3);
+        
+        Eigen::Matrix4f Twb_new = Eigen::Matrix4f::Identity();
+        Twb_new.block<3,3>(0,0) = Rgw * R_old;
+        Twb_new.block<3,1>(0,3) = Rgw * t_old;
+        
+        kf->SetTwb(Twb_new);
+    }
+    
+    // Transform velocities: v_new = Rgw * v_old
+    for (const auto& kf : m_keyframes) {
+        Eigen::Vector3f vel_old = kf->GetVelocity();
+        Eigen::Vector3f vel_new = Rgw * vel_old;
+        kf->SetVelocity(vel_new);
+    }
+    
+    // =========================================================================
+    // STEP 2: Apply scale correction (relative to first keyframe)
+    // =========================================================================
+    
+    if (std::abs(scale_factor - 1.0f) > 1e-6) {
+        // Scale keyframe poses relative to first keyframe
+        Eigen::Matrix4f Twb_0 = m_keyframes[0]->GetTwb();
+        
+        for (size_t i = 1; i < m_keyframes.size(); ++i) {
+            Eigen::Matrix4f Twb_i = m_keyframes[i]->GetTwb();
+            Eigen::Matrix4f T_0_i = Twb_0.inverse() * Twb_i;
+            T_0_i.block<3,1>(0,3) *= scale_factor;  // Scale translation relative to first
+            m_keyframes[i]->SetTwb(Twb_0 * T_0_i);
+        }
+        
+        // Scale velocities
+        for (const auto& kf : m_keyframes) {
+            Eigen::Vector3f vel = kf->GetVelocity();
+            vel *= scale_factor;
+            kf->SetVelocity(vel);
+        }
+        
+        // Scale MapPoints relative to first camera
+        Eigen::Matrix4f Twc_0 = m_keyframes[0]->GetTwc();
+        Eigen::Matrix4f Tcw_0 = Twc_0.inverse();
+        
+        for (const auto& mp : unique_mps) {
+            Eigen::Vector3f pos_w = mp->GetPosition();
+            // Transform to first camera frame
+            Eigen::Vector3f pos_c = Tcw_0.block<3,3>(0,0) * pos_w + Tcw_0.block<3,1>(0,3);
+            // Apply scale
+            pos_c *= scale_factor;
+            // Transform back to world
+            Eigen::Vector3f pos_w_new = Twc_0.block<3,3>(0,0) * pos_c + Twc_0.block<3,1>(0,3);
+            mp->SetPosition(pos_w_new);
+        }
+    }
+    
+    // Check if current frame is already in keyframes (same object)
+    bool current_in_keyframes = false;
+    for (const auto& kf : m_keyframes) {
+        if (kf.get() == m_current_frame.get()) {
+            current_in_keyframes = true;
+            break;
+        }
+    }
+    
+    // Update current pose from keyframe if it's the same object
+    if (m_current_frame) {
+        if (current_in_keyframes) {
+            // Current frame is already transformed via keyframes, just update m_current_pose
+            m_current_pose = m_current_frame->GetTwb();
+        } else {
+            // Current frame is different, need to transform separately
+            Eigen::Matrix4f Twb_old = m_current_frame->GetTwb();
+            Eigen::Matrix3f R_old = Twb_old.block<3,3>(0,0);
+            Eigen::Vector3f t_old = Twb_old.block<3,1>(0,3);
+            
+            Eigen::Matrix4f Twb_new = Eigen::Matrix4f::Identity();
+            Twb_new.block<3,3>(0,0) = Rgw * R_old;
+            Twb_new.block<3,1>(0,3) = scale_factor * Rgw * t_old;
+            
+            m_current_frame->SetTwb(Twb_new);
+            m_current_pose = Twb_new;
+        }
+    }
+    
+    LOG_INFO("Gravity aligned: scale={:.4f}, {} kfs, {} mps", 
+             scale_factor, m_keyframes.size(), unique_mps.size());
 }
 
 } // namespace vio_360

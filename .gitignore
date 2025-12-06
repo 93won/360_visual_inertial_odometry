@@ -2,7 +2,7 @@
 build/
 bin/
 lib/
-
+ref/ 
 # CMake
 CMakeCache.txt
 CMakeFiles/

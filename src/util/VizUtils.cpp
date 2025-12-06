@@ -167,8 +167,11 @@ bool VizUtils::ShouldClose() {
 void VizUtils::Draw3DScene(const Estimator* estimator) {
     if (!estimator) return;
     
-    // Draw coordinate axis
-    DrawAxis(1.0f);
+    // Draw XY grid and axis only after IMU initialization (when gravity is aligned to -Z)
+    if (estimator->IsIMUInitialized()) {
+        DrawGrid(20.0f, 1.0f);
+        DrawAxis(1.0f);
+    }
     
     // Draw MapPoints currently being tracked (with matching colors from tracking view)
     if (*m_show_init_result && estimator->IsInitialized()) {
@@ -245,6 +248,39 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
         glPopMatrix();
         
         glLineWidth(1.0f);  // Reset line width
+        
+        // Draw gravity vector (red arrow pointing down in -Z direction) after IMU init
+        if (estimator->IsIMUInitialized()) {
+            float arrow_length = 1.0f;  // 1 meter arrow
+            Eigen::Vector3f gravity_dir(0.0f, 0.0f, -1.0f);  // -Z direction after IMU init
+            Eigen::Vector3f arrow_end = pos + arrow_length * gravity_dir;
+            
+            glColor3f(1.0f, 0.0f, 0.0f);  // Red
+            glLineWidth(3.0f);
+            glBegin(GL_LINES);
+            glVertex3f(pos.x(), pos.y(), pos.z());
+            glVertex3f(arrow_end.x(), arrow_end.y(), arrow_end.z());
+            glEnd();
+            
+            // Draw arrowhead
+            float head_size = 0.1f;
+            glBegin(GL_LINES);
+            // Left wing
+            glVertex3f(arrow_end.x(), arrow_end.y(), arrow_end.z());
+            glVertex3f(arrow_end.x() - head_size, arrow_end.y(), arrow_end.z() + head_size);
+            // Right wing
+            glVertex3f(arrow_end.x(), arrow_end.y(), arrow_end.z());
+            glVertex3f(arrow_end.x() + head_size, arrow_end.y(), arrow_end.z() + head_size);
+            // Front wing
+            glVertex3f(arrow_end.x(), arrow_end.y(), arrow_end.z());
+            glVertex3f(arrow_end.x(), arrow_end.y() - head_size, arrow_end.z() + head_size);
+            // Back wing
+            glVertex3f(arrow_end.x(), arrow_end.y(), arrow_end.z());
+            glVertex3f(arrow_end.x(), arrow_end.y() + head_size, arrow_end.z() + head_size);
+            glEnd();
+            
+            glLineWidth(1.0f);
+        }
     }
 }
 
@@ -360,6 +396,32 @@ void VizUtils::DrawAxis(float size) {
     glColor3f(0.0f, 0.0f, 1.0f);
     glVertex3f(0, 0, 0);
     glVertex3f(0, 0, size);
+    
+    glEnd();
+}
+
+void VizUtils::DrawGrid(float size, float spacing) {
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+    
+    // Grid color - light gray
+    glColor4f(0.5f, 0.5f, 0.5f, 0.5f);
+    
+    int num_lines = static_cast<int>(size / spacing);
+    
+    // Lines parallel to X axis
+    for (int i = -num_lines; i <= num_lines; ++i) {
+        float y = i * spacing;
+        glVertex3f(-size, y, 0.0f);
+        glVertex3f(size, y, 0.0f);
+    }
+    
+    // Lines parallel to Y axis
+    for (int i = -num_lines; i <= num_lines; ++i) {
+        float x = i * spacing;
+        glVertex3f(x, -size, 0.0f);
+        glVertex3f(x, size, 0.0f);
+    }
     
     glEnd();
 }

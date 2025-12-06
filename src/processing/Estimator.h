@@ -126,6 +126,30 @@ public:
     bool IsInitialized() const { return m_initialized; }
     
     /**
+     * @brief Check if IMU is initialized
+     * @return True if IMU initialized
+     */
+    bool IsIMUInitialized() const { return m_imu_initialized; }
+    
+    /**
+     * @brief Get estimated gravity direction
+     * @return Gravity vector in world frame
+     */
+    Eigen::Vector3f GetGravity() const { return m_gravity; }
+    
+    /**
+     * @brief Get IMU gyro bias
+     * @return Gyro bias [rad/s]
+     */
+    Eigen::Vector3f GetGyroBias() const { return m_gyro_bias; }
+    
+    /**
+     * @brief Get IMU accel bias
+     * @return Accel bias [m/s^2]
+     */
+    Eigen::Vector3f GetAccelBias() const { return m_accel_bias; }
+    
+    /**
      * @brief Get initialized 3D points (map points from initialization)
      * @return Vector of 3D points in world coordinates
      */
@@ -193,7 +217,14 @@ private:
     
     // Initialization state
     bool m_initialized;
+    bool m_imu_initialized;
     float m_min_parallax;
+    
+    // IMU states
+    Eigen::Vector3f m_gravity;      // Gravity in world frame
+    Eigen::Vector3f m_gyro_bias;    // Gyro bias [rad/s]
+    Eigen::Vector3f m_accel_bias;   // Accel bias [m/s^2]
+    double m_scale;                 // Visual-inertial scale
     
     // Initialized map points and poses
     std::vector<Eigen::Vector3f> m_initialized_points;  // 3D points from initialization
@@ -241,6 +272,39 @@ private:
      * @param imu_data IMU measurements between frames
      */
     void ProcessIMU(const std::vector<IMUData>& imu_data);
+    
+    /**
+     * @brief Predict state using IMU preintegration
+     * Uses IMU data between previous and current frame to predict pose and velocity.
+     * @return True if prediction successful
+     */
+    bool PredictStateWithIMU();
+    
+    /**
+     * @brief Try to initialize IMU (gravity, velocities, biases)
+     * Requires at least 3 keyframes with preintegration
+     * @return True if IMU initialization successful
+     */
+    bool TryInitializeIMU();
+    
+    /**
+     * @brief Update all preintegrations in keyframes with new bias values
+     * Called after optimization updates the bias estimates
+     * @param new_gyro_bias New gyro bias
+     * @param new_accel_bias New accel bias
+     */
+    void UpdatePreintegrationsWithNewBias(const Eigen::Vector3f& new_gyro_bias,
+                                          const Eigen::Vector3f& new_accel_bias);
+    
+    /**
+     * @brief Apply gravity alignment transformation to world coordinate system
+     * Transforms all keyframe poses, MapPoints, and velocities so that:
+     * - Gravity points in -Z direction in new world frame
+     * - Scale is applied to all positions (if monocular)
+     * @param Rwg Rotation from old world to gravity-aligned world
+     * @param scale Scale factor to apply (1.0 for stereo/RGBD)
+     */
+    void ApplyGravityAlignmentTransform(const Eigen::Matrix3f& Rwg, float scale);
     
     /**
      * @brief Link MapPoints from previous frame to current frame based on feature tracking
