@@ -43,8 +43,8 @@ install_deps
 mkdir -p build
 cd build
 
-# Configure with CMake
-cmake ..
+# Configure with CMake (disable TBB and SuiteSparse for compatibility with newer system libs)
+cmake .. -DTBB_FOUND=FALSE -DSUITESPARSE=OFF
 
 # Build
 make -j$(nproc)

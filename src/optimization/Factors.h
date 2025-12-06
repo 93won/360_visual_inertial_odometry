@@ -66,6 +66,7 @@ public:
                   const Eigen::Vector3d& world_point,
                   const CameraParameters& camera_params,
                   const Eigen::Matrix4d& Tcb,
+                  const Eigen::Matrix4d& T_wb_init,
                   const Eigen::Matrix2d& information = Eigen::Matrix2d::Identity());
 
     /**
@@ -117,6 +118,7 @@ private:
     Eigen::Vector3d m_world_point;    // 3D world coordinates
     CameraParameters m_camera_params; // Camera intrinsics
     Eigen::Matrix4d m_Tcb;            // Body-to-camera transformation (T_CB)
+    Eigen::Matrix4d m_T_wb_init;      // Initial pose (for right perturbation)
     Eigen::Matrix2d m_information;    // Information matrix (precision matrix)
     bool m_is_outlier;                // Outlier flag to disable optimization
 };
@@ -140,6 +142,7 @@ public:
     BAFactor(const Eigen::Vector2d& observation,
              const CameraParameters& camera_params,
              const Eigen::Matrix4d& Tcb,
+             const Eigen::Matrix4d& T_wb_init,
              const Eigen::Matrix2d& information = Eigen::Matrix2d::Identity());
 
     /**
@@ -195,6 +198,7 @@ private:
     Eigen::Vector2d m_observation;    // Observed pixel coordinates
     CameraParameters m_camera_params; // Camera intrinsics
     Eigen::Matrix4d m_Tcb;            // Body-to-camera transformation (T_CB)
+    Eigen::Matrix4d m_T_wb_init;      // Initial pose (for right perturbation)
     Eigen::Matrix2d m_information;    // Information matrix (precision matrix)
     bool m_is_outlier;                // Outlier flag to disable optimization
 };

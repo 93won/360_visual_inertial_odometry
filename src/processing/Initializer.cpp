@@ -162,10 +162,8 @@ bool Initializer::TryMonocularInitialization(
     
     LOG_INFO("  [MonoInit] Validation passed, mean_reproj={:.2f}px", mean_reproj_error);
     
-    // 8. Skip scale normalization - keep original scale from triangulation
-    // This is important for VIO where IMU provides absolute scale
-    // float scale_factor = NormalizeScale(points3d, t);
-    float scale_factor = 1.0f;  // Keep original scale
+    // 8. Normalize scale so median depth = 10.0 (reasonable indoor/outdoor scale)
+    float scale_factor = NormalizeScale(points3d, t);
     
     // 9. Set frame poses
     // Essential matrix gives us camera-to-camera transformation T_c1c2
@@ -1019,8 +1017,9 @@ float Initializer::NormalizeScale(
         median_depth = depths[mid];
     }
     
-    // Scale factor to normalize median depth to 1.0
-    float scale_factor = 1.0f / median_depth;
+    // Scale factor to normalize median depth to 10.0 (reasonable scene scale)
+    const float target_median_depth = 10.0f;
+    float scale_factor = target_median_depth / median_depth;
     
     // Scale all 3D points
     for (auto& pt : points3d) {

@@ -45,43 +45,28 @@ bool Optimizer::IsNearBoundary(const cv::Point2f& pixel) const {
 }
 
 void Optimizer::PoseToParams(const Eigen::Matrix4f& pose, double* params) {
-    // Convert SE3 matrix to tangent space [trans(3), rot(3)]
-    // Order matches Jacobian column order in PnPFactor and BAFactor
-    Eigen::Matrix3f R = pose.block<3, 3>(0, 0);
-    Eigen::Vector3f t = pose.block<3, 1>(0, 3);
+    // Convert SE3 matrix to tangent space [rho(3), phi(3)] using SE3::log()
+    // This is consistent with SE3::exp() used in Factors
+    SE3d se3(pose.cast<double>());
+    Eigen::Matrix<double, 6, 1> xi = se3.log();
     
-    // Rotation to axis-angle using Rodrigues
-    Eigen::AngleAxisf aa(R);
-    Eigen::Vector3f axis_angle = aa.axis() * aa.angle();
-    
-    // [translation, rotation] - matches Jacobian order
-    params[0] = t.x();
-    params[1] = t.y();
-    params[2] = t.z();
-    params[3] = axis_angle.x();
-    params[4] = axis_angle.y();
-    params[5] = axis_angle.z();
+    // xi = [rho, phi] where rho is the translation part in tangent space
+    params[0] = xi(0);
+    params[1] = xi(1);
+    params[2] = xi(2);
+    params[3] = xi(3);
+    params[4] = xi(4);
+    params[5] = xi(5);
 }
 
 Eigen::Matrix4f Optimizer::ParamsToPose(const double* params) {
-    // Convert tangent space [trans(3), rot(3)] to SE3 matrix
-    // Order matches PoseToParams
-    Eigen::Vector3f t(params[0], params[1], params[2]);
-    Eigen::Vector3f axis_angle(params[3], params[4], params[5]);
+    // Convert tangent space [rho(3), phi(3)] to SE3 matrix using SE3::exp()
+    // This is consistent with SE3::exp() used in Factors
+    Eigen::Matrix<double, 6, 1> xi;
+    xi << params[0], params[1], params[2], params[3], params[4], params[5];
     
-    float angle = axis_angle.norm();
-    Eigen::Matrix3f R;
-    if (angle < 1e-8f) {
-        R = Eigen::Matrix3f::Identity();
-    } else {
-        Eigen::Vector3f axis = axis_angle / angle;
-        R = Eigen::AngleAxisf(angle, axis).toRotationMatrix();
-    }
-    
-    Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
-    pose.block<3, 3>(0, 0) = R;
-    pose.block<3, 1>(0, 3) = t;
-    return pose;
+    SE3d se3 = SE3d::exp(xi);
+    return se3.matrix().cast<float>();
 }
 
 ceres::Solver::Options Optimizer::SetupSolverOptions(int max_iterations) {
@@ -154,26 +139,34 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
     // Information matrix
     Eigen::Matrix2d info = Eigen::Matrix2d::Identity() / (m_pixel_noise_std * m_pixel_noise_std);
     
-    // Store initial pose for reset each round
-    double initial_pose_params[6];
-    PoseToParams(frame->GetTwb(), initial_pose_params);
+    // Store initial pose (for right perturbation approach)
+    Eigen::Matrix4f T_wb_init = frame->GetTwb();
+    Eigen::Matrix4d T_wb_init_d = T_wb_init.cast<double>();
     
-    // Setup pose parameters (SE3 tangent space)
-    double pose_params[6];
-    std::copy(initial_pose_params, initial_pose_params + 6, pose_params);
+    // Log initial pose for debugging
+    Eigen::Vector3f init_pos = T_wb_init.block<3,1>(0,3);
+    LOG_DEBUG("  [PnP] Frame {} init pose: ({:.4f},{:.4f},{:.4f}), {} observations",
+              frame->GetFrameId(), init_pos.x(), init_pos.y(), init_pos.z(), observations.size());
+    
+    // Setup pose parameters as perturbation (initialized to zero)
+    // Right perturbation: T_wb = T_wb_init * exp(delta_xi)
+    double pose_params[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     
     // Build optimization problem
     ceres::Problem problem;
     std::vector<factor::PnPFactor*> factors;
     std::vector<size_t> feature_indices;
+    std::vector<std::shared_ptr<MapPoint>> mappoints;  // Store MapPoints for marginalized check
     
     for (const auto& [pixel_coord, mp, feat_idx] : observations) {
         Eigen::Vector2d obs(pixel_coord.x, pixel_coord.y);
         Eigen::Vector3d world_pt = mp->GetPosition().cast<double>();
         
-        auto* cost = new factor::PnPFactor(obs, world_pt, cam_params, T_cb, info);
+        // Pass initial pose to factor for right perturbation
+        auto* cost = new factor::PnPFactor(obs, world_pt, cam_params, T_cb, T_wb_init_d, info);
         factors.push_back(cost);
         feature_indices.push_back(feat_idx);
+        mappoints.push_back(mp);
         
         problem.AddResidualBlock(
             cost,
@@ -191,9 +184,9 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
     ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
     
     for (int round = 0; round < num_rounds; ++round) {
-        // Reset pose to initial value for each round
+        // Reset perturbation to zero for each round (right perturbation approach)
         if (round > 0) {
-            std::copy(initial_pose_params, initial_pose_params + 6, pose_params);
+            std::fill(pose_params, pose_params + 6, 0.0);
         }
         
         // Solve
@@ -214,10 +207,27 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         int num_inliers = 0;
         int num_outliers = 0;
         double inlier_reproj_sum = 0.0;
+        double max_chi2 = 0.0;
+        double max_inlier_chi2 = 0.0;
+        int chi2_bins[6] = {0};  // [0-2], [2-6], [6-10], [10-50], [50-100], [100+]
         
         for (size_t i = 0; i < factors.size(); ++i) {
             double chi2 = factors[i]->compute_chi_square(&params_ptr);
-            bool is_outlier = (chi2 > 5.991);
+            
+            // Marginalized MapPoints should never be marked as outliers (they preserve scale)
+            bool is_marginalized = mappoints[i]->IsMarginalized();
+            bool is_outlier = !is_marginalized && (chi2 > 5.991);
+            
+            // Track max chi2
+            if (chi2 > max_chi2) max_chi2 = chi2;
+            
+            // Bin distribution
+            if (chi2 < 2.0) chi2_bins[0]++;
+            else if (chi2 < 6.0) chi2_bins[1]++;
+            else if (chi2 < 10.0) chi2_bins[2]++;
+            else if (chi2 < 50.0) chi2_bins[3]++;
+            else if (chi2 < 100.0) chi2_bins[4]++;
+            else chi2_bins[5]++;
             
             factors[i]->set_outlier(is_outlier);
             
@@ -228,7 +238,16 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
                 // Convert bearing error to approximate pixel error for logging
                 // (bearing_error * image_width / (2*pi) gives rough pixel equivalent)
                 inlier_reproj_sum += chi2;  // degrees for logging
+                if (chi2 > max_inlier_chi2) max_inlier_chi2 = chi2;
             }
+        }
+        
+        // Debug log for error distribution on final round
+        if (round == num_rounds - 1) {
+            LOG_DEBUG("  [PnP] chi2 dist: [0-2]={} [2-6]={} [6-10]={} [10-50]={} [50-100]={} [100+]={}",
+                     chi2_bins[0], chi2_bins[1], chi2_bins[2], chi2_bins[3], chi2_bins[4], chi2_bins[5]);
+            LOG_DEBUG("  [PnP] max_chi2={:.1f}, max_inlier_chi2={:.1f}, mean_inlier={:.2f}",
+                     max_chi2, max_inlier_chi2, num_inliers > 0 ? inlier_reproj_sum / num_inliers : 0.0);
         }
         
         // Update result
@@ -246,11 +265,15 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
                   round, num_inliers, num_outliers, final_cost);
     }
     
-    // Update frame pose with final optimized value
-    result.optimized_pose = ParamsToPose(pose_params);
+    // Compute final pose: T_wb = T_wb_init * exp(delta_xi) (right perturbation)
+    Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params);
+    SE3d T_wb_init_se3(T_wb_init_d);
+    SE3d delta_T = SE3d::exp(delta_xi);
+    SE3d T_wb_final = T_wb_init_se3 * delta_T;
+    result.optimized_pose = T_wb_final.matrix().cast<float>();
     
     // Log pose change for debugging
-    Eigen::Matrix4f old_pose = frame->GetTwb();
+    Eigen::Matrix4f old_pose = T_wb_init;
     Eigen::Vector3f old_pos = old_pose.block<3,1>(0,3);
     Eigen::Vector3f new_pos = result.optimized_pose.block<3,1>(0,3);
     float pos_change = (new_pos - old_pos).norm();
@@ -318,11 +341,13 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
     
     // Parameter blocks
     std::vector<std::array<double, 6>> pose_params(frames.size());
+    std::vector<Eigen::Matrix4d> T_wb_inits(frames.size());  // Store initial poses for right perturbation
     std::vector<std::array<double, 3>> point_params(mappoints.size());
     
-    // Initialize pose parameters
+    // Initialize pose parameters as zero perturbation (right perturbation approach)
     for (size_t i = 0; i < frames.size(); ++i) {
-        PoseToParams(frames[i]->GetTwb(), pose_params[i].data());
+        T_wb_inits[i] = frames[i]->GetTwb().cast<double>();
+        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // Zero perturbation
     }
     
     // Initialize point parameters and create index map
@@ -366,7 +391,8 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
             size_t pi = it->second;
             Eigen::Vector2d obs(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
             
-            auto* cost = new factor::BAFactor(obs, cam_params, T_cb, info);
+            // Pass initial pose for right perturbation
+            auto* cost = new factor::BAFactor(obs, cam_params, T_cb, T_wb_inits[fi], info);
             factors.push_back(cost);
             factor_indices.push_back({fi, pi});
             
@@ -423,8 +449,10 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
     }
     
     // Mark MapPoints as bad if ALL observations are outliers (more conservative)
+    // But NEVER mark marginalized MapPoints as bad (they preserve scale)
     int bad_mp_count = 0;
     for (const auto& mp : mappoints) {
+        if (mp->IsMarginalized()) continue;  // Marginalized MapPoints must not be removed
         int inliers = mp_inlier_count[mp];
         int outliers = mp_outlier_count[mp];
         // Only mark bad if no inliers at all and at least 2 outlier observations
@@ -436,12 +464,17 @@ BAResult Optimizer::RunBA(const std::vector<std::shared_ptr<Frame>>& frames,
     
     
     // Update frames and MapPoints
+    // Compute final pose: T_wb = T_wb_init * exp(delta_xi) (right perturbation)
     for (size_t i = 0; i < frames.size(); ++i) {
-        frames[i]->SetTwb(ParamsToPose(pose_params[i].data()));
+        Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params[i].data());
+        SE3d T_wb_init_se3(T_wb_inits[i]);
+        SE3d delta_T = SE3d::exp(delta_xi);
+        SE3d T_wb_final = T_wb_init_se3 * delta_T;
+        frames[i]->SetTwb(T_wb_final.matrix().cast<float>());
     }
     
     for (size_t i = 0; i < mappoints.size(); ++i) {
-        if (!mappoints[i]->IsBad()) {
+        if (!mappoints[i]->IsBad() && !mappoints[i]->IsMarginalized()) {
             Eigen::Vector3f pos(point_params[i][0], point_params[i][1], point_params[i][2]);
             mappoints[i]->SetPosition(pos);
         }
@@ -510,11 +543,13 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     
     // Parameter blocks
     std::vector<std::array<double, 6>> pose_params(all_frames.size());
+    std::vector<Eigen::Matrix4d> T_wb_inits(all_frames.size());  // Store initial poses for right perturbation
     std::vector<std::array<double, 3>> point_params(mappoints.size());
     
-    // Initialize pose parameters
+    // Initialize pose parameters as zero perturbation (right perturbation approach)
     for (size_t i = 0; i < all_frames.size(); ++i) {
-        PoseToParams(all_frames[i]->GetTwb(), pose_params[i].data());
+        T_wb_inits[i] = all_frames[i]->GetTwb().cast<double>();
+        pose_params[i] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};  // Zero perturbation
     }
     
     // Initialize point parameters and create index map
@@ -564,7 +599,8 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
             
             Eigen::Vector2d obs_pixel(feature->GetPixelCoord().x, feature->GetPixelCoord().y);
             
-            auto* cost = new factor::BAFactor(obs_pixel, cam_params, T_cb, info);
+            // Pass initial pose for right perturbation
+            auto* cost = new factor::BAFactor(obs_pixel, cam_params, T_cb, T_wb_inits[fi], info);
             factors.push_back(cost);
             factor_indices.push_back({fi, pi});
             
@@ -583,17 +619,17 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         poses_in_problem.insert(fi);
     }
     
-    // For scale stability: fix ALL keyframes except the last one
-    // Only the last (newest) keyframe pose is optimized
+    // For scale stability: fix only the first keyframe
+    // All other keyframes are optimized
+    constexpr size_t NUM_FIXED_KEYFRAMES = 1;
     int fixed_count = 0;
     int optimized_count = 0;
-    size_t last_frame_idx = all_frames.size() - 1;
     
     for (size_t i = 0; i < all_frames.size(); ++i) {
         if (poses_in_problem.count(i) == 0) continue;
         
-        if (i != last_frame_idx) {
-            // Fix all keyframes except the last one
+        if (i < NUM_FIXED_KEYFRAMES) {
+            // Fix oldest N keyframes for scale stability
             problem.SetParameterBlockConstant(pose_params[i].data());
             fixed_count++;
         } else {
@@ -606,7 +642,7 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     int fixed_mp_count = 0;
     int optimized_mp_count = 0;
     for (size_t i = 0; i < mappoints.size(); ++i) {
-        if (mappoints[i]->IsFixed()) {
+        if (mappoints[i]->IsMarginalized()) {
             problem.SetParameterBlockConstant(point_params[i].data());
             fixed_mp_count++;
         } else {
@@ -614,19 +650,8 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
         }
     }
     
-    LOG_INFO("  LocalBA: {} window frames (fix {}, optimize last only), {} MapPoints ({} fixed, {} optimize), {} factors",
-             window_frames.size(), fixed_count, mappoints.size(), fixed_mp_count, optimized_mp_count, factors.size());
-    
-    // Debug: print poses before BA
-    LOG_INFO("  Before BA poses:");
-    size_t last_idx = window_frames.size() - 1;
-    for (size_t i = 0; i < window_frames.size(); ++i) {
-        Eigen::Matrix4f T = window_frames[i]->GetTwb();
-        Eigen::Vector3f pos = T.block<3,1>(0,3);
-        LOG_INFO("    Frame {}: pos=({:.4f},{:.4f},{:.4f}){}", 
-                 window_frames[i]->GetFrameId(), pos.x(), pos.y(), pos.z(),
-                 i != last_idx ? " [FIXED]" : " [OPTIMIZE]");
-    }
+    LOG_DEBUG("  LocalBA: {} window frames (fix oldest {}, optimize {}), {} MapPoints ({} fixed, {} optimize), {} factors",
+             window_frames.size(), fixed_count, optimized_count, mappoints.size(), fixed_mp_count, optimized_mp_count, factors.size());
     
     // Solve
     ceres::Solver::Options options = SetupSolverOptions(m_max_iterations);
@@ -664,8 +689,10 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     }
     
     // Mark MapPoints as bad if ALL observations are outliers
+    // But NEVER mark marginalized MapPoints as bad (they preserve scale)
     int bad_mp_count = 0;
     for (const auto& mp : mappoints) {
+        if (mp->IsMarginalized()) continue;  // Marginalized MapPoints must not be removed
         int inliers = mp_inlier_count[mp];
         int outliers = mp_outlier_count[mp];
         if (inliers == 0 && outliers >= 2) {
@@ -675,27 +702,25 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     }
     
     if (bad_mp_count > 0) {
-        LOG_INFO("  LocalBA: marked {} MapPoints as bad", bad_mp_count);
+        LOG_DEBUG("  LocalBA: marked {} MapPoints as bad", bad_mp_count);
     }
     
-    // Update only the last keyframe pose (only one being optimized)
-    size_t last_frame_idx_update = all_frames.size() - 1;
-    all_frames[last_frame_idx_update]->SetTwb(ParamsToPose(pose_params[last_frame_idx_update].data()));
-    
-    // Debug: print poses after BA
-    LOG_INFO("  After BA poses:");
-    for (size_t i = 0; i < window_frames.size(); ++i) {
-        Eigen::Matrix4f T = window_frames[i]->GetTwb();
-        Eigen::Vector3f pos = T.block<3,1>(0,3);
-        LOG_INFO("    Frame {}: pos=({:.4f},{:.4f},{:.4f}){}", 
-                 window_frames[i]->GetFrameId(), pos.x(), pos.y(), pos.z(),
-                 i != last_frame_idx_update ? " [FIXED]" : " [OPTIMIZED]");
+    // Update all optimized frame poses (frames after NUM_FIXED_KEYFRAMES)
+    // Compute final pose: T_wb = T_wb_init * exp(delta_xi) (right perturbation)
+    for (size_t i = NUM_FIXED_KEYFRAMES; i < all_frames.size(); ++i) {
+        if (poses_in_problem.count(i) == 0) continue;  // Skip if not in problem
+        
+        Eigen::Map<const Eigen::Vector6d> delta_xi(pose_params[i].data());
+        SE3d T_wb_init_se3(T_wb_inits[i]);
+        SE3d delta_T = SE3d::exp(delta_xi);
+        SE3d T_wb_final = T_wb_init_se3 * delta_T;
+        all_frames[i]->SetTwb(T_wb_final.matrix().cast<float>());
     }
     
     // Update MapPoints that were optimized (not fixed)
     int mp_updated = 0;
     for (size_t i = 0; i < mappoints.size(); ++i) {
-        if (!mappoints[i]->IsFixed()) {
+        if (!mappoints[i]->IsMarginalized()) {
             Eigen::Vector3f new_pos(point_params[i][0], point_params[i][1], point_params[i][2]);
             mappoints[i]->SetPosition(new_pos);
             mp_updated++;

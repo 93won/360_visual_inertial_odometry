@@ -49,21 +49,34 @@ Eigen::Vector3f SO3::Log() const {
     
     const float sin_theta = std::sin(theta);
     if (std::abs(sin_theta) < kEpsilon) {
-        // θ ≈ π case: need special handling
-        // Find the axis as the eigenvector with eigenvalue 1
+        // θ ≈ π case: need special handling for sign ambiguity
+        // R = I + 2 * axis * axis^T - I = 2 * axis * axis^T when θ = π
+        // So axis * axis^T = (R + I) / 2
+        // Diagonal gives axis[i]^2 = (R[i,i] + 1) / 2
         Eigen::Vector3f axis;
         
-        // Check which diagonal element is largest
+        // Check which diagonal element is largest for numerical stability
         int max_idx = 0;
         if (m_matrix(1, 1) > m_matrix(0, 0)) max_idx = 1;
         if (m_matrix(2, 2) > m_matrix(max_idx, max_idx)) max_idx = 2;
         
         axis[max_idx] = std::sqrt((m_matrix(max_idx, max_idx) + 1.0f) * 0.5f);
         
+        // Off-diagonal: axis[i] * axis[j] = R[i,j] / 2 (for i != j)
         for (int i = 0; i < 3; ++i) {
             if (i != max_idx) {
                 axis[i] = m_matrix(max_idx, i) / (2.0f * axis[max_idx]);
             }
+        }
+        
+        // Fix sign ambiguity: choose sign so that the result is consistent
+        // with the skew-symmetric part of R (ensures continuity)
+        Eigen::Vector3f skew_axis = Vee(m_matrix - m_matrix.transpose()) * 0.5f;
+        
+        // If skew_axis is not zero, use it to determine the sign
+        float dot = axis.dot(skew_axis);
+        if (dot < 0) {
+            axis = -axis;  // Flip sign to maintain consistency
         }
         
         return axis * theta;
@@ -220,20 +233,36 @@ Eigen::Vector3d SO3d::Log() const {
     
     const double sin_theta = std::sin(theta);
     if (std::abs(sin_theta) < kEpsilonD) {
-        // θ ≈ π case: need special handling
+        // θ ≈ π case: need special handling for sign ambiguity
+        // R = I + 2 * axis * axis^T - I = 2 * axis * axis^T when θ = π
+        // So axis * axis^T = (R + I) / 2
+        // Diagonal gives axis[i]^2 = (R[i,i] + 1) / 2
         Eigen::Vector3d axis;
         
-        // Check which diagonal element is largest
+        // Check which diagonal element is largest for numerical stability
         int max_idx = 0;
         if (m_matrix(1, 1) > m_matrix(0, 0)) max_idx = 1;
         if (m_matrix(2, 2) > m_matrix(max_idx, max_idx)) max_idx = 2;
         
         axis[max_idx] = std::sqrt((m_matrix(max_idx, max_idx) + 1.0) * 0.5);
         
+        // Off-diagonal: axis[i] * axis[j] = R[i,j] / 2 (for i != j)
         for (int i = 0; i < 3; ++i) {
             if (i != max_idx) {
                 axis[i] = m_matrix(max_idx, i) / (2.0 * axis[max_idx]);
             }
+        }
+        
+        // Fix sign ambiguity: choose sign so that the result is consistent
+        // with the skew-symmetric part of R (ensures continuity)
+        // The skew-symmetric part (R - R^T)/2 should have the same sign pattern
+        Eigen::Vector3d skew_axis = Veed(m_matrix - m_matrix.transpose()) * 0.5;
+        
+        // If skew_axis is not zero, use it to determine the sign
+        // skew_axis ≈ sin(θ) * axis, so sign should match
+        double dot = axis.dot(skew_axis);
+        if (dot < 0) {
+            axis = -axis;  // Flip sign to maintain consistency
         }
         
         return axis * theta;

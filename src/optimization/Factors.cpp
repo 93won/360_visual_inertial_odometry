@@ -24,9 +24,11 @@ PnPFactor::PnPFactor(const Eigen::Vector2d& observation,
                             const Eigen::Vector3d& world_point,
                             const CameraParameters& camera_params,
                             const Eigen::Matrix4d& Tcb,
+                            const Eigen::Matrix4d& T_wb_init,
                             const Eigen::Matrix2d& information)
     : m_observation(observation), m_world_point(world_point), 
-      m_camera_params(camera_params), m_Tcb(Tcb), m_information(information), m_is_outlier(false) {}
+      m_camera_params(camera_params), m_Tcb(Tcb), m_T_wb_init(T_wb_init),
+      m_information(information), m_is_outlier(false) {}
 
 bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, double** jacobians) const {
     // If marked as outlier, set residuals to zero and jacobians to zero
@@ -41,25 +43,27 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
         return true;
     }
 
-    // Extract SE3 parameters from tangent space (Ceres order: tx,ty,tz,rx,ry,rz)
-    Eigen::Map<const Eigen::Vector6d> se3_tangent(parameters[0]);
+    // Right perturbation approach: T_wb = T_wb_init * exp(delta_xi)
+    // Parameters are small perturbations, not absolute pose
+    Eigen::Map<const Eigen::Vector6d> delta_xi(parameters[0]);
     
-    // Convert tangent space to SE3 using Sophus exp (consistent with parameterization)
-    vio_360::SE3d T_wb = vio_360::SE3d::exp(se3_tangent);
+    // Apply perturbation to initial pose
+    vio_360::SE3d T_wb_init(m_T_wb_init);
+    vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+    vio_360::SE3d T_wb = T_wb_init * delta_T;  // Right perturbation
     
-    // Convert T_wb (b→w) to T_cw (w→c) transformation
-    Eigen::Matrix3d R_wb = T_wb.rotationMatrix();
-    Eigen::Vector3d t_wb = T_wb.translation();
-    Eigen::Matrix3d R_bw = R_wb.transpose();        // w→b rotation
-    Eigen::Vector3d t_bw = -R_bw * t_wb;            // w→b translation
+    // T_bw = T_wb^(-1) using SE3d inverse
+    vio_360::SE3d T_bw = T_wb.inverse();
+    Eigen::Matrix3d R_bw = T_bw.rotationMatrix();
+    Eigen::Vector3d t_bw = T_bw.translation();
     
     // T_cw = T_cb * T_bw  (w→b then b→c = w→c)
     // m_Tcb is T_cb (b→c, body to camera)
-    Eigen::Matrix3d R_cw = m_Tcb.block<3, 3>(0, 0) * R_bw;
-    Eigen::Vector3d t_cw = m_Tcb.block<3, 3>(0, 0) * t_bw + m_Tcb.block<3, 1>(0, 3);
+    vio_360::SE3d T_cb(m_Tcb);
+    vio_360::SE3d T_cw = T_cb * T_bw;
     
-    // Transform world point to camera coordinates: Pc = R_cw * Pw + t_cw
-    Eigen::Vector3d point_camera = R_cw * m_world_point + t_cw;
+    // Transform world point to camera coordinates: Pc = T_cw * Pw
+    Eigen::Vector3d point_camera = T_cw * m_world_point;
     
     double pcx = point_camera.x();
     double pcy = point_camera.y();
@@ -102,6 +106,22 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
     }
     
     Eigen::Vector2d residual_vec(du, dv);
+    
+    // Check for large errors (likely wrap-around boundary issues)
+    // If error is too large, treat as outlier to prevent optimization instability
+    const double max_pixel_error = 100.0;  // Maximum allowed pixel error
+    bool is_large_error = (std::abs(du) > max_pixel_error || std::abs(dv) > max_pixel_error);
+    
+    if (is_large_error) {
+        // Set large but finite residual and zero Jacobian
+        residuals[0] = max_pixel_error;
+        residuals[1] = max_pixel_error;
+        if (jacobians && jacobians[0]) {
+            Eigen::Map<Eigen::Matrix<double, 2, 6, Eigen::RowMajor>> jac(jacobians[0]);
+            jac.setZero();
+        }
+        return true;
+    }
 
     // Apply information matrix weighting to residuals: r_weighted = sqrt(Info) * r
     Eigen::LLT<Eigen::Matrix2d> llt(m_information);
@@ -190,24 +210,19 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
 }
 
 double PnPFactor::compute_chi_square(double const* const* parameters) const {
-    // Extract SE3 parameters from tangent space (Ceres order: tx,ty,tz,rx,ry,rz)
-    Eigen::Map<const Eigen::Vector6d> se3_tangent(parameters[0]);
+    // Right perturbation: T_wb = T_wb_init * exp(delta_xi)
+    Eigen::Map<const Eigen::Vector6d> delta_xi(parameters[0]);
     
-    // Convert tangent space to SE3 using Sophus exp (consistent with parameterization)
-    vio_360::SE3d T_wb = vio_360::SE3d::exp(se3_tangent);
+    vio_360::SE3d T_wb_init(m_T_wb_init);
+    vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+    vio_360::SE3d T_wb = T_wb_init * delta_T;
     
-    // Convert T_wb (b→w) to T_cw (w→c) transformation
-    Eigen::Matrix3d R_wb = T_wb.rotationMatrix();
-    Eigen::Vector3d t_wb = T_wb.translation();
-    Eigen::Matrix3d R_bw = R_wb.transpose();        // w→b rotation
-    Eigen::Vector3d t_bw = -R_bw * t_wb;            // w→b translation
+    // T_cw = T_cb * T_bw = T_cb * T_wb^(-1)
+    vio_360::SE3d T_cb(m_Tcb);
+    vio_360::SE3d T_cw = T_cb * T_wb.inverse();
     
-    // T_cw = T_cb * T_bw  (w→b then b→c = w→c)
-    Eigen::Matrix3d R_cw = m_Tcb.block<3, 3>(0, 0) * R_bw;
-    Eigen::Vector3d t_cw = m_Tcb.block<3, 3>(0, 0) * t_bw + m_Tcb.block<3, 1>(0, 3);
-    
-    // Transform world point to camera coordinates: Pc = R_cw * Pw + t_cw
-    Eigen::Vector3d point_camera = R_cw * m_world_point + t_cw;
+    // Transform world point to camera coordinates
+    Eigen::Vector3d point_camera = T_cw * m_world_point;
     
     double pcx = point_camera.x();
     double pcy = point_camera.y();
@@ -250,23 +265,19 @@ double PnPFactor::compute_chi_square(double const* const* parameters) const {
 }
 
 double PnPFactor::compute_bearing_angle_error(double const* const* parameters) const {
-    // Extract SE3 parameters from tangent space
-    Eigen::Map<const Eigen::Vector6d> se3_tangent(parameters[0]);
+    // Right perturbation: T_wb = T_wb_init * exp(delta_xi)
+    Eigen::Map<const Eigen::Vector6d> delta_xi(parameters[0]);
     
-    // Convert tangent space to SE3
-    vio_360::SE3d T_wb = vio_360::SE3d::exp(se3_tangent);
+    vio_360::SE3d T_wb_init(m_T_wb_init);
+    vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+    vio_360::SE3d T_wb = T_wb_init * delta_T;
     
-    // Convert T_wb (b→w) to T_cw (w→c) transformation
-    Eigen::Matrix3d R_wb = T_wb.rotationMatrix();
-    Eigen::Vector3d t_wb = T_wb.translation();
-    Eigen::Matrix3d R_bw = R_wb.transpose();
-    Eigen::Vector3d t_bw = -R_bw * t_wb;
-    
-    Eigen::Matrix3d R_cw = m_Tcb.block<3, 3>(0, 0) * R_bw;
-    Eigen::Vector3d t_cw = m_Tcb.block<3, 3>(0, 0) * t_bw + m_Tcb.block<3, 1>(0, 3);
+    // T_cw = T_cb * T_wb^(-1)
+    vio_360::SE3d T_cb(m_Tcb);
+    vio_360::SE3d T_cw = T_cb * T_wb.inverse();
     
     // Transform world point to camera coordinates
-    Eigen::Vector3d point_camera = R_cw * m_world_point + t_cw;
+    Eigen::Vector3d point_camera = T_cw * m_world_point;
     double L_proj = point_camera.norm();
     
     if (L_proj < 1e-10) {
@@ -303,10 +314,12 @@ double PnPFactor::compute_bearing_angle_error(double const* const* parameters) c
 BAFactor::BAFactor(const Eigen::Vector2d& observation,
                    const CameraParameters& camera_params,
                    const Eigen::Matrix4d& Tcb,
+                   const Eigen::Matrix4d& T_wb_init,
                    const Eigen::Matrix2d& information)
     : m_observation(observation)
     , m_camera_params(camera_params)
     , m_Tcb(Tcb)
+    , m_T_wb_init(T_wb_init)
     , m_information(information)
     , m_is_outlier(false) {
 }
@@ -334,28 +347,28 @@ bool BAFactor::Evaluate(double const* const* parameters,
     }
     
     try {
-        // Extract pose parameters (SE3 tangent space)
-        Eigen::Map<const Eigen::Vector6d> pose_tangent(parameters[0]);
+        // Right perturbation approach: T_wb = T_wb_init * exp(delta_xi)
+        Eigen::Map<const Eigen::Vector6d> delta_xi(parameters[0]);
         
         // Extract 3D point in world coordinates
         Eigen::Map<const Eigen::Vector3d> world_point(parameters[1]);
         
-        // Convert tangent space to SE3 (Twb: body to world)
-        vio_360::SE3d Twb = vio_360::SE3d::exp(pose_tangent);
+        // Apply perturbation to initial pose
+        vio_360::SE3d T_wb_init(m_T_wb_init);
+        vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+        vio_360::SE3d Twb = T_wb_init * delta_T;  // Right perturbation
         
-        // Get rotation and translation matrices
-        Eigen::Matrix3d Rwb = Twb.rotationMatrix();
-        Eigen::Vector3d twb = Twb.translation();
-        Eigen::Matrix3d Rbw = Rwb.transpose();
-        Eigen::Vector3d tbw = -Rbw * twb;
+        // T_bw = T_wb^(-1), T_cw = T_cb * T_bw
+        vio_360::SE3d Tbw = Twb.inverse();
+        vio_360::SE3d Tcb(m_Tcb);
+        vio_360::SE3d Tcw = Tcb * Tbw;
         
-        // Compute Tcw (camera to world transformation)
-        // Tcw = Tcb * Tbw = Tcb * Twb^(-1)
-        Eigen::Matrix3d Rcw = m_Tcb.block<3, 3>(0, 0) * Rbw;
-        Eigen::Vector3d tcw = m_Tcb.block<3, 3>(0, 0) * tbw + m_Tcb.block<3, 1>(0, 3);
+        // For Jacobian computation, we still need individual components
+        Eigen::Matrix3d Rbw = Tbw.rotationMatrix();
+        Eigen::Vector3d tbw = Tbw.translation();
         
         // Transform world point to camera coordinates
-        Eigen::Vector3d camera_point = Rcw * world_point + tcw;
+        Eigen::Vector3d camera_point = Tcw * world_point;
         
         double pcx = camera_point[0];
         double pcy = camera_point[1];
@@ -406,6 +419,26 @@ bool BAFactor::Evaluate(double const* const* parameters,
         }
         
         Eigen::Vector2d error(du, dv);
+        
+        // Check for large errors (likely wrap-around boundary issues)
+        const double max_pixel_error = 100.0;
+        bool is_large_error = (std::abs(du) > max_pixel_error || std::abs(dv) > max_pixel_error);
+        
+        if (is_large_error) {
+            residuals[0] = max_pixel_error;
+            residuals[1] = max_pixel_error;
+            if (jacobians) {
+                if (jacobians[0]) {
+                    Eigen::Map<Eigen::Matrix<double, 2, 6, Eigen::RowMajor>> jac_pose(jacobians[0]);
+                    jac_pose.setZero();
+                }
+                if (jacobians[1]) {
+                    Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> jac_point(jacobians[1]);
+                    jac_point.setZero();
+                }
+            }
+            return true;
+        }
         
         // Apply information matrix weighting using Cholesky decomposition: r_weighted = sqrt(Info) * r
         Eigen::LLT<Eigen::Matrix2d> llt(m_information);
@@ -523,27 +556,21 @@ double BAFactor::compute_chi_square(double const* const* parameters) const {
     // So this becomes: error^T * Information^2 * error, which is incorrect for chi-square test
     
     // We need to compute the unweighted error and then apply information matrix properly
-    // Let's recompute the unweighted error for proper chi-square calculation
-    
-    // Extract SE3 pose from parameters
-    Eigen::Map<const Eigen::Vector6d> se3_tangent(parameters[0]);
-    vio_360::SE3d Twb = vio_360::SE3d::exp(se3_tangent);
+    // Right perturbation: T_wb = T_wb_init * exp(delta_xi)
+    Eigen::Map<const Eigen::Vector6d> delta_xi(parameters[0]);
+    vio_360::SE3d T_wb_init(m_T_wb_init);
+    vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+    vio_360::SE3d Twb = T_wb_init * delta_T;
     
     // Extract 3D point
     Eigen::Map<const Eigen::Vector3d> world_point(parameters[1]);
     
-    // Transform world point to camera coordinates (same as Evaluate())
-    Eigen::Matrix3d Rwb = Twb.rotationMatrix();
-    Eigen::Vector3d twb = Twb.translation();
-    Eigen::Matrix3d Rbw = Rwb.transpose();
-    Eigen::Vector3d tbw = -Rbw * twb;
+    // T_cw = T_cb * T_wb^(-1)
+    vio_360::SE3d Tcb(m_Tcb);
+    vio_360::SE3d Tcw = Tcb * Twb.inverse();
     
-    // Tcw = Tcb * Tbw
-    Eigen::Matrix3d Rcw = m_Tcb.block<3, 3>(0, 0) * Rbw;
-    Eigen::Vector3d tcw = m_Tcb.block<3, 3>(0, 0) * tbw + m_Tcb.block<3, 1>(0, 3);
-    
-    // Camera coordinates: Pc = Rcw * Pw + tcw
-    Eigen::Vector3d camera_point = Rcw * world_point + tcw;
+    // Camera coordinates: Pc = Tcw * Pw
+    Eigen::Vector3d camera_point = Tcw * world_point;
     
     double pcx = camera_point.x();
     double pcy = camera_point.y();
@@ -589,23 +616,20 @@ double BAFactor::compute_bearing_angle_error(double const* const* parameters) co
         return 0.0;
     }
     
-    // Extract SE3 pose from parameters
-    Eigen::Map<const Eigen::Vector6d> se3_tangent(parameters[0]);
-    vio_360::SE3d Twb = vio_360::SE3d::exp(se3_tangent);
+    // Right perturbation: T_wb = T_wb_init * exp(delta_xi)
+    Eigen::Map<const Eigen::Vector6d> delta_xi(parameters[0]);
+    vio_360::SE3d T_wb_init(m_T_wb_init);
+    vio_360::SE3d delta_T = vio_360::SE3d::exp(delta_xi);
+    vio_360::SE3d Twb = T_wb_init * delta_T;
     
     // Extract 3D point
     Eigen::Map<const Eigen::Vector3d> world_point(parameters[1]);
     
-    // Transform world point to camera coordinates
-    Eigen::Matrix3d Rwb = Twb.rotationMatrix();
-    Eigen::Vector3d twb = Twb.translation();
-    Eigen::Matrix3d Rbw = Rwb.transpose();
-    Eigen::Vector3d tbw = -Rbw * twb;
+    // T_cw = T_cb * T_wb^(-1)
+    vio_360::SE3d Tcb(m_Tcb);
+    vio_360::SE3d Tcw = Tcb * Twb.inverse();
     
-    Eigen::Matrix3d Rcw = m_Tcb.block<3, 3>(0, 0) * Rbw;
-    Eigen::Vector3d tcw = m_Tcb.block<3, 3>(0, 0) * tbw + m_Tcb.block<3, 1>(0, 3);
-    
-    Eigen::Vector3d camera_point = Rcw * world_point + tcw;
+    Eigen::Vector3d camera_point = Tcw * world_point;
     double L_proj = camera_point.norm();
     
     if (L_proj < 1e-10) {

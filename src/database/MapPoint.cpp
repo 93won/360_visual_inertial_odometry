@@ -25,7 +25,7 @@ MapPoint::MapPoint()
     , m_position(Eigen::Vector3f::Zero())
     , m_is_bad(false)
     , m_is_triangulated(false)
-    , m_is_fixed(false)
+    , m_is_marginalized(false)
 {
 }
 
@@ -34,7 +34,7 @@ MapPoint::MapPoint(const Eigen::Vector3f& position)
     , m_position(position)
     , m_is_bad(false)
     , m_is_triangulated(true)
-    , m_is_fixed(false)
+    , m_is_marginalized(false)
 {
 }
 

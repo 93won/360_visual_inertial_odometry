@@ -170,31 +170,20 @@ void VizUtils::Draw3DScene(const Estimator* estimator) {
     // Draw coordinate axis
     DrawAxis(1.0f);
     
-    // Draw MapPoints from all keyframes
+    // Draw MapPoints currently being tracked (with matching colors from tracking view)
     if (*m_show_init_result && estimator->IsInitialized()) {
-        const auto& keyframes = estimator->GetKeyframes();
-        
-        // Collect unique MapPoints from all keyframes
-        std::set<std::shared_ptr<MapPoint>> unique_mappoints;
-        for (const auto& kf : keyframes) {
-            const auto& features = kf->GetFeatures();
-            for (size_t i = 0; i < features.size(); ++i) {
-                auto mp = kf->GetMapPoint(static_cast<int>(i));
-                if (mp && !mp->IsBad()) {
-                    unique_mappoints.insert(mp);
-                }
-            }
-        }
-        
-        // Draw MapPoints
-        if (!unique_mappoints.empty()) {
+        if (!m_current_tracked_mappoints.empty()) {
             glPointSize(static_cast<float>(*m_point_size) * 2.0f);
             glBegin(GL_POINTS);
-            glColor3f(0.0f, 1.0f, 0.0f);  // Green for MapPoints
             
-            for (const auto& mp : unique_mappoints) {
-                Eigen::Vector3f pt = mp->GetPosition();
-                glVertex3f(pt.x(), pt.y(), pt.z());
+            for (size_t i = 0; i < m_current_tracked_mappoints.size(); ++i) {
+                const auto& mp = m_current_tracked_mappoints[i];
+                if (mp && !mp->IsBad()) {
+                    const Eigen::Vector3f& color = m_current_tracked_colors[i];
+                    glColor3f(color.x(), color.y(), color.z());
+                    Eigen::Vector3f pt = mp->GetPosition();
+                    glVertex3f(pt.x(), pt.y(), pt.z());
+                }
             }
             
             glEnd();
@@ -401,6 +390,27 @@ cv::Scalar VizUtils::GetColorFromAge(int age, int max_age) {
     return cv::Scalar(b, g, r);
 }
 
+cv::Scalar VizUtils::GetColorFromX(float x, float width) {
+    // Blue (left) -> Red (right) based on x position
+    float ratio = std::max(0.0f, std::min(1.0f, x / width));
+    
+    // Simple blue to red gradient
+    int r = static_cast<int>(255 * ratio);
+    int b = static_cast<int>(255 * (1.0f - ratio));
+    int g = 0;
+    
+    return cv::Scalar(b, g, r);  // BGR format
+}
+
+void VizUtils::GetColorFromXForGL(float x, float width, float& r, float& g, float& b) {
+    // Blue (left) -> Red (right) based on x position
+    float ratio = std::max(0.0f, std::min(1.0f, x / width));
+    
+    r = ratio;
+    g = 0.0f;
+    b = 1.0f - ratio;
+}
+
 cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
                                std::shared_ptr<Frame> current_frame,
                                std::shared_ptr<Frame> previous_frame) {
@@ -414,6 +424,7 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
     if (!current_frame) return vis_image;
     
     const auto& features = current_frame->GetFeatures();
+    float img_width = static_cast<float>(image.cols);
     
     // Check if system is initialized (has any MapPoints)
     bool has_mappoints = false;
@@ -424,6 +435,10 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
             break;
         }
     }
+    
+    // Store current frame's tracked MapPoints and their colors for 3D visualization
+    m_current_tracked_mappoints.clear();
+    m_current_tracked_colors.clear();
     
     // Draw tracking lines
     if (previous_frame) {
@@ -446,7 +461,8 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
                         cv::Point2f curr_pt = feature->GetPixelCoord();
                         cv::Point2f prev_pt = prev_feature->GetPixelCoord();
                         
-                        cv::Scalar color = GetColorFromAge(feature->GetAge(), 10);
+                        // Use x-position based color: blue (left) -> red (right)
+                        cv::Scalar color = GetColorFromX(curr_pt.x, img_width);
                         cv::line(vis_image, prev_pt, curr_pt, color, 1, cv::LINE_AA);
                         break;
                     }
@@ -466,10 +482,18 @@ cv::Mat VizUtils::DrawTracking(const cv::Mat& image,
             if (!mp || mp->IsBad()) {
                 continue;  // Skip outliers
             }
+            
+            // Store MapPoint and its color for 3D visualization
+            cv::Point2f pt = feature->GetPixelCoord();
+            float r, g, b;
+            GetColorFromXForGL(pt.x, img_width, r, g, b);
+            m_current_tracked_mappoints.push_back(mp);
+            m_current_tracked_colors.push_back(Eigen::Vector3f(r, g, b));
         }
         
         cv::Point2f pt = feature->GetPixelCoord();
-        cv::Scalar color = GetColorFromAge(feature->GetAge(), 10);
+        // Use x-position based color: blue (left) -> red (right)
+        cv::Scalar color = GetColorFromX(pt.x, img_width);
         cv::circle(vis_image, pt, 3, color, -1, cv::LINE_AA);
         inlier_count++;
     }

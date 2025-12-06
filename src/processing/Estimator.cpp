@@ -69,8 +69,6 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
     // Create new frame
     m_current_frame = CreateFrame(image, timestamp);
     
-    LOG_INFO("ProcessFrame {}: m_initialized={}", m_current_frame->GetFrameId(), m_initialized);
-    
     if (!m_initialized) {
         // Not initialized yet - accumulate frames for initialization
         if (m_previous_frame) {
@@ -89,20 +87,18 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
             m_frame_window.erase(m_frame_window.begin());
         }
         
-        LOG_INFO("  Window size: {}/{}, trying init...", m_frame_window.size(), m_window_size);
+        LOG_DEBUG("  Window size: {}/{}, trying init...", m_frame_window.size(), m_window_size);
         
         // Try to initialize when window is full
         if (static_cast<int>(m_frame_window.size()) == m_window_size) {
             bool init_result = TryInitialize();
-            
-            LOG_INFO("  TryInitialize returned: {}", init_result);
             
             if (init_result) {
                 // Initialization succeeded!
                 result.init_success = true;
                 m_initialized = true;
                 
-                LOG_INFO("  >>> INITIALIZATION SUCCESS! m_initialized set to true <<<");
+                LOG_INFO("Initialization SUCCESS!");
                 
                 // Set initialization keyframes
                 auto first_frame = m_frame_window.front();
@@ -114,10 +110,6 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
                 m_keyframes.push_back(first_frame);
                 m_keyframes.push_back(last_frame);
                 m_last_keyframe = last_frame;
-                
-                LOG_INFO("Set keyframes: {} and {} (last_keyframe={})", 
-                         first_frame->GetFrameId(), last_frame->GetFrameId(), 
-                         m_last_keyframe->GetFrameId());
             } else {
                 // Check if ready for initialization (sufficient parallax)
                 if (m_frame_window.size() >= 2) {
@@ -174,9 +166,9 @@ Estimator::EstimationResult Estimator::ProcessFrame(const cv::Mat& image, double
                 }
                 
                 m_current_pose = m_current_frame->GetTwb();
-                LOG_INFO("Frame {}: PnP {} in/{} out, reproj {:.2f}px, parallax {:.1f}px",
+                LOG_INFO("Frame {}: PnP {} in/{} out, cost {:.2f}->{:.2f}",
                          m_current_frame->GetFrameId(), pnp_result.num_inliers, pnp_result.num_outliers,
-                         pnp_result.final_cost, parallax_from_kf);
+                         pnp_result.initial_cost, pnp_result.final_cost);
                 
                 result.success = true;
             } else {
@@ -265,7 +257,7 @@ Estimator::EstimationResult Estimator::ProcessFrame(
                 m_all_keyframes.push_back(last_frame);
                 m_last_keyframe = last_frame;
                 
-                LOG_INFO("Set keyframes: {} and {} (last_keyframe={})", 
+                LOG_DEBUG("Set keyframes: {} and {} (last_keyframe={})", 
                          first_frame->GetFrameId(), last_frame->GetFrameId(), 
                          m_last_keyframe->GetFrameId());
                 
@@ -305,9 +297,16 @@ Estimator::EstimationResult Estimator::ProcessFrame(
             }
         }
         
-        // Constant velocity model: predict pose from previous frame
-        Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
-        m_current_frame->SetTwb(predicted_pose);
+        // Initialize pose using constant velocity motion model
+        // T_current = T_prev * delta_T, where delta_T = T_{prev-1}^{-1} * T_prev
+        if (m_transform_from_last.isIdentity(1e-6)) {
+            // First frame after initialization, use previous pose
+            m_current_frame->SetTwb(m_previous_frame->GetTwb());
+        } else {
+            // Apply motion model: predict current pose from velocity
+            Eigen::Matrix4f predicted_pose = m_previous_frame->GetTwb() * m_transform_from_last;
+            m_current_frame->SetTwb(predicted_pose);
+        }
         
         // Pose estimation using PnP
         if (valid_mp_count >= 6) {
@@ -332,10 +331,6 @@ Estimator::EstimationResult Estimator::ProcessFrame(
                 // Update current pose and transform for next frame
                 m_current_pose = m_current_frame->GetTwb();
                 m_transform_from_last = m_previous_frame->GetTwb().inverse() * m_current_pose;
-                
-                LOG_INFO("Frame {}: PnP {} in/{} out, reproj {:.2f}px, parallax {:.1f}px",
-                         m_current_frame->GetFrameId(), pnp_result.num_inliers, pnp_result.num_outliers,
-                         pnp_result.final_cost, parallax_from_kf);
                 
                 result.success = true;
             } else {
@@ -408,7 +403,7 @@ void Estimator::ProcessIMU(const std::vector<IMUData>& imu_data) {
 
 bool Estimator::TryInitialize() {
     if (m_frame_window.size() < 2) {
-        LOG_INFO("[Init] Window size {} < 2, skip", m_frame_window.size());
+        LOG_DEBUG("[Init] Window size {} < 2, skip", m_frame_window.size());
         return false;
     }
     
@@ -419,20 +414,20 @@ bool Estimator::TryInitialize() {
     // Compute parallax between first and last frames
     float parallax = m_initializer->ComputeParallax(first_frame, last_frame);
     
-    LOG_INFO("[Init] Frame {}->{}: parallax={:.2f}px (min={:.2f})", 
+    LOG_DEBUG("[Init] Frame {}->{}: parallax={:.2f}px (min={:.2f})", 
              first_frame->GetFrameId(), last_frame->GetFrameId(), 
              parallax, m_min_parallax);
     
     // Check if parallax is sufficient
     if (parallax < m_min_parallax) {
-        LOG_INFO("[Init] Insufficient parallax, waiting...");
+        LOG_DEBUG("[Init] Insufficient parallax, waiting...");
         return false;
     }
     
     // Step 1: Select features with sufficient observations
     auto selected_features = m_initializer->SelectFeaturesForInit(m_frame_window);
     
-    LOG_INFO("[Init] Selected {} features for initialization", selected_features.size());
+    LOG_DEBUG("[Init] Selected {} features for initialization", selected_features.size());
     
     if (selected_features.empty()) {
         LOG_WARN("[Init] No features selected, skip");
@@ -440,7 +435,7 @@ bool Estimator::TryInitialize() {
     }
     
     // Step 2: Try monocular initialization
-    LOG_INFO("[Init] Attempting monocular initialization...");
+    LOG_DEBUG("[Init] Attempting monocular initialization...");
     InitializationResult init_result;
     bool init_success = m_initializer->TryMonocularInitialization(m_frame_window, init_result);
     
@@ -449,12 +444,12 @@ bool Estimator::TryInitialize() {
         return false;
     }
     
-    LOG_INFO("[Init] Monocular init SUCCESS: {} MapPoints created", init_result.initialized_mappoints.size());
+    LOG_INFO("Monocular init: {} MapPoints created", init_result.initialized_mappoints.size());
     
-    // Mark initialization MapPoints as fixed (they define the scale)
+    // Mark initialization MapPoints as marginalized (they define the scale)
     for (const auto& mp : init_result.initialized_mappoints) {
         if (mp) {
-            mp->SetFixed(true);
+            mp->SetMarginalized(true);
         }
     }
     
@@ -554,7 +549,7 @@ bool Estimator::ShouldCreateKeyframe() {
     
     // Create keyframe if parallax exceeds threshold
     if (parallax >= parallax_threshold) {
-        LOG_INFO("Parallax {:.2f} >= {:.2f}, creating new keyframe", parallax, parallax_threshold);
+        LOG_DEBUG("Parallax {:.2f} >= {:.2f}, creating new keyframe", parallax, parallax_threshold);
         return true;
     }
     
@@ -595,22 +590,47 @@ void Estimator::CreateKeyframe() {
     while (static_cast<int>(m_keyframes.size()) > max_keyframes) {
         auto oldest_keyframe = m_keyframes.front();
         
-        // Fix MapPoints whose reference keyframe is being removed
-        // This preserves scale by locking points that originated from this keyframe
+        // For MapPoints whose reference keyframe is being removed:
+        // Transfer reference to another keyframe in the window (keep MapPoint alive)
         const auto& old_kf_features = oldest_keyframe->GetFeatures();
-        int fixed_count = 0;
+        int transferred_count = 0;
+        int deleted_count = 0;
+        
         for (size_t i = 0; i < old_kf_features.size(); ++i) {
             auto mp = oldest_keyframe->GetMapPoint(static_cast<int>(i));
-            if (mp && !mp->IsBad() && !mp->IsFixed()) {
+            if (mp && !mp->IsBad()) {
                 // Check if this keyframe is the reference (origin) for this MapPoint
                 if (mp->IsReferenceKeyframe(oldest_keyframe)) {
-                    mp->SetFixed(true);
-                    fixed_count++;
+                    // Find the oldest keyframe in window that observes this MapPoint
+                    std::shared_ptr<Frame> new_ref_keyframe = nullptr;
+                    
+                    // Iterate through keyframes in window (oldest to newest, skipping the one being removed)
+                    for (size_t kf_idx = 1; kf_idx < m_keyframes.size(); ++kf_idx) {
+                        auto& kf = m_keyframes[kf_idx];
+                        if (mp->IsObservedByFrame(kf)) {
+                            new_ref_keyframe = kf;
+                            break;  // Take the oldest one in window
+                        }
+                    }
+                    
+                    if (new_ref_keyframe) {
+                        // Transfer reference to new keyframe
+                        // Marginalize the MapPoint to preserve scale (its original reference defined the scale)
+                        mp->SetReferenceKeyframe(new_ref_keyframe);
+                        mp->SetMarginalized(true);  // Marginalize MapPoint when reference keyframe is removed
+                        transferred_count++;
+                    } else {
+                        // No keyframe in window observes this MapPoint, mark as bad
+                        mp->SetBad(true);
+                        deleted_count++;
+                    }
                 }
             }
         }
-        if (fixed_count > 0) {
-            LOG_INFO("  Fixed {} MapPoints from removed keyframe {}", fixed_count, oldest_keyframe->GetFrameId());
+        
+        if (transferred_count > 0 || deleted_count > 0) {
+            LOG_DEBUG("  Reference transfer: {} MapPoints moved, {} deleted (from removed kf {})", 
+                     transferred_count, deleted_count, oldest_keyframe->GetFrameId());
         }
         
         // Clean up observations from MapPoints before removing the keyframe
@@ -637,12 +657,12 @@ void Estimator::CreateKeyframe() {
     
     // Run local BA if we have new MapPoints
     if (new_points > 0 && m_keyframes.size() >= 2) {
-        LOG_INFO("Running local BA with {} keyframes...", m_keyframes.size());
         Optimizer optimizer;
         optimizer.SetCamera(m_camera, m_boundary_margin);
         BAResult ba_result = optimizer.RunLocalBA(m_keyframes);  // Sliding window BA
-        LOG_INFO("Local BA done: {} inliers, {} outliers", 
-                 ba_result.num_inliers, ba_result.num_outliers);
+        LOG_INFO("LocalBA: {} in/{} out, cost {:.2f}->{:.2f}", 
+                 ba_result.num_inliers, ba_result.num_outliers,
+                 ba_result.initial_cost, ba_result.final_cost);
         
         // Update m_current_pose with BA-optimized pose
         m_current_pose = m_current_frame->GetTwb();
@@ -651,9 +671,6 @@ void Estimator::CreateKeyframe() {
         // Next frame will start from the BA-optimized keyframe pose
         m_transform_from_last = Eigen::Matrix4f::Identity();
     }
-    
-    LOG_INFO("Created keyframe {} (total: {}), triangulated {} new MapPoints", 
-             m_current_frame->GetFrameId(), m_keyframes.size(), new_points);
 }
 
 void Estimator::LinkMapPointsFromPreviousFrame() {
@@ -692,7 +709,7 @@ void Estimator::LinkMapPointsFromPreviousFrame() {
         }
     }
     
-    LOG_INFO("LinkMapPoints: prev had {} MPs, linked {} to current frame", prev_with_mp, linked_count);
+    LOG_DEBUG("LinkMapPoints: prev had {} MPs, linked {} to current frame", prev_with_mp, linked_count);
 }
 
 void Estimator::ProcessIntermediateFrames() {
@@ -720,7 +737,7 @@ void Estimator::ProcessIntermediateFrames() {
     
     int n_frames = static_cast<int>(m_frame_window.size());
     
-    LOG_INFO("Processing {} intermediate frames...", n_frames - 2);
+    LOG_DEBUG("Processing {} intermediate frames...", n_frames - 2);
     
     // Process intermediate frames (skip first and last which are keyframes)
     for (int i = 1; i < n_frames - 1; ++i) {
@@ -770,18 +787,18 @@ void Estimator::ProcessIntermediateFrames() {
             Optimizer optimizer;
             optimizer.SetCamera(m_camera, m_boundary_margin);
             PnPResult pnp_result = optimizer.SolvePnP(frame);
-            LOG_INFO("  Frame {}: interpolated -> PnP {} in/{} out, reproj {:.2f}px",
+            LOG_DEBUG("  Frame {}: interpolated -> PnP {} in/{} out, reproj {:.2f}px",
                      frame->GetFrameId(), pnp_result.num_inliers, pnp_result.num_outliers,
                      pnp_result.final_cost);
         }
     }
     
     // Run BA on all frames in window
-    LOG_INFO("Running BA on {} frames in initialization window...", n_frames);
+    LOG_DEBUG("Running BA on {} frames in initialization window...", n_frames);
     Optimizer optimizer;
     optimizer.SetCamera(m_camera, m_boundary_margin);
     BAResult ba_result = optimizer.RunBA(m_frame_window, true, false);
-    LOG_INFO("Init window BA done: {} inliers, {} outliers", 
+    LOG_DEBUG("Init window BA done: {} inliers, {} outliers", 
              ba_result.num_inliers, ba_result.num_outliers);
     
     // Mark all intermediate frames as keyframes and add to keyframe list
@@ -791,7 +808,7 @@ void Estimator::ProcessIntermediateFrames() {
         // Insert in order (after first keyframe, before last keyframe)
         m_keyframes.insert(m_keyframes.end() - 1, frame);
     }
-    LOG_INFO("Added {} intermediate frames as keyframes (total: {})", 
+    LOG_DEBUG("Added {} intermediate frames as keyframes (total: {})", 
              n_frames - 2, m_keyframes.size());
 }
 
@@ -929,7 +946,7 @@ int Estimator::TriangulateNewMapPoints(
     const auto& features1 = kf1->GetFeatures();
     const auto& features2 = kf2->GetFeatures();
     
-    LOG_INFO("Triangulation: kf1={} ({} feats), kf2={} ({} feats)",
+    LOG_DEBUG("Triangulation: kf1={} ({} feats), kf2={} ({} feats)",
              kf1->GetFrameId(), features1.size(), kf2->GetFrameId(), features2.size());
     
     // Build map: feature_id -> (index in kf1, feature pointer)
@@ -956,7 +973,7 @@ int Estimator::TriangulateNewMapPoints(
     Eigen::Vector3f C2 = -R2.transpose() * t2;
     
     float baseline = (C1 - C2).norm();
-    LOG_INFO("  Baseline: {:.6f}, C1=({:.4f},{:.4f},{:.4f}), C2=({:.4f},{:.4f},{:.4f})",
+    LOG_DEBUG("  Baseline: {:.6f}, C1=({:.4f},{:.4f},{:.4f}), C2=({:.4f},{:.4f},{:.4f})",
              baseline, C1.x(), C1.y(), C1.z(), C2.x(), C2.y(), C2.z());
     
     int triangulated_count = 0;
@@ -1091,7 +1108,7 @@ int Estimator::TriangulateNewMapPoints(
         triangulated_count++;
     }
     
-    LOG_INFO("  Matched: {}, already_has_mp: {}, depth_fail: {}, reproj_fail: {}, success: {}",
+    LOG_DEBUG("  Matched: {}, already_has_mp: {}, depth_fail: {}, reproj_fail: {}, success: {}",
              matched_count, already_has_mp, depth_failed, reproj_failed, triangulated_count);
     
     return triangulated_count;

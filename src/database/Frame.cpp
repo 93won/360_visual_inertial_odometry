@@ -79,11 +79,9 @@ void Frame::SetTwb(const Eigen::Matrix4f& T_wb) {
 }
 
 Eigen::Matrix4f Frame::GetTwc() const {
-    std::lock_guard<std::mutex> lock(m_pose_mutex);
-    
-    Eigen::Matrix4f T_wb = Eigen::Matrix4f::Identity();
-    T_wb.block<3, 3>(0, 0) = m_rotation;
-    T_wb.block<3, 1>(0, 3) = m_translation;
+    // Use GetTwb() to properly handle keyframe/non-keyframe cases
+    // Note: GetTwb() acquires the lock, so we don't lock here to avoid deadlock
+    Eigen::Matrix4f T_wb = GetTwb();
     
     // T_wc = T_wb * T_bc
     return T_wb * m_T_BC;

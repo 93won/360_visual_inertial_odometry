@@ -32,6 +32,7 @@ namespace vio_360 {
 // Forward declarations
 class Frame;
 class Estimator;
+class MapPoint;
 
 /**
  * @brief Visualization utility class for 360 VIO
@@ -95,11 +96,21 @@ public:
     static cv::Scalar GetColorFromAge(int age, int max_age = 10);
     
     /**
+     * @brief Get color from x position (blue left -> red right)
+     */
+    static cv::Scalar GetColorFromX(float x, float width);
+    
+    /**
+     * @brief Get OpenGL color from x position
+     */
+    static void GetColorFromXForGL(float x, float width, float& r, float& g, float& b);
+    
+    /**
      * @brief Draw tracking visualization
      */
-    static cv::Mat DrawTracking(const cv::Mat& image,
-                                std::shared_ptr<Frame> current_frame,
-                                std::shared_ptr<Frame> previous_frame);
+    cv::Mat DrawTracking(const cv::Mat& image,
+                         std::shared_ptr<Frame> current_frame,
+                         std::shared_ptr<Frame> previous_frame);
 
 private:
     // Window dimensions
@@ -128,6 +139,10 @@ private:
     // Pause state
     bool m_paused;
     bool m_step_requested;
+    
+    // Currently tracked MapPoints and their colors (for matching colors between 2D and 3D views)
+    std::vector<std::shared_ptr<MapPoint>> m_current_tracked_mappoints;
+    std::vector<Eigen::Vector3f> m_current_tracked_colors;
     
     // Mutex for thread safety
     std::mutex m_mutex;

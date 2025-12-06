@@ -107,8 +107,8 @@ public:
     void SetTriangulated(bool triangulated = true) { m_is_triangulated = triangulated; }
     bool IsTriangulated() const { return m_is_triangulated; }
     
-    void SetFixed(bool fixed = true) { m_is_fixed = fixed; }
-    bool IsFixed() const { return m_is_fixed; }
+    void SetMarginalized(bool marginalized = true) { m_is_marginalized = marginalized; }
+    bool IsMarginalized() const { return m_is_marginalized; }
     
     // ============ Reference Keyframe Management ============
     
@@ -151,7 +151,7 @@ private:
     
     bool m_is_bad;                               ///< Bad flag (invalid point)
     bool m_is_triangulated;                      ///< Successfully triangulated
-    bool m_is_fixed;                             ///< Fixed flag (do not optimize in BA)
+    bool m_is_marginalized;                      ///< Marginalized flag (do not optimize or remove)
     
     std::weak_ptr<Frame> m_reference_keyframe;   ///< First keyframe that observed this point (origin)
     

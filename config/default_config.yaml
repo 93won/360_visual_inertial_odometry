@@ -33,7 +33,7 @@ tracking:
 initialization:
   window_size: 10
   min_parallax: 10.0
-  min_features: 50
+  min_features: 100
   min_observations: 10
   grid_cols: 20
   grid_rows: 10
