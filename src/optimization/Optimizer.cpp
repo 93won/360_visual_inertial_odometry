@@ -200,7 +200,7 @@ PnPResult Optimizer::SolvePnP(std::shared_ptr<Frame> frame, bool fix_mappoints) 
         total_iterations += summary.iterations.size();
         
         // Bearing-based outlier detection for equirectangular cameras
-        // Threshold: 2 degrees = 0.035 radians (more lenient than Stella's 1 degree)
+        // Threshold: 2 degrees = 0.035 radians
         const double bearing_threshold = 2.0 * M_PI / 180.0;  // 2 degrees in radians
         
         const double* params_ptr = pose_params;
@@ -659,7 +659,7 @@ BAResult Optimizer::RunLocalBA(const std::vector<std::shared_ptr<Frame>>& window
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     
-    // Chi-square based outlier detection (Stella VSLAM style)
+    // Chi-square based outlier detection
     // chi_sq_2D = 5.99146 for 2 DOF with 5% significance level
     constexpr double chi_sq_threshold = 5.99146;
     

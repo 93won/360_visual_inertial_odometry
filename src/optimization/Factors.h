@@ -107,7 +107,7 @@ public:
     double compute_bearing_angle_error(double const* const* parameters) const;
 
     /**
-     * @brief Compute reprojection error in pixels for Stella VSLAM style outlier detection
+     * @brief Compute reprojection error in pixels for outlier detection
      * @param parameters SE3 pose parameters in tangent space [6]
      * @return Squared reprojection error in pixels^2
      */
@@ -187,7 +187,7 @@ public:
     double compute_bearing_angle_error(double const* const* parameters) const;
 
     /**
-     * @brief Compute reprojection error in pixels for Stella VSLAM style outlier detection
+     * @brief Compute reprojection error in pixels for outlier detection
      * @param parameters[0] SE3 pose parameters in tangent space [6]
      * @param parameters[1] 3D point position in world coordinates [3]
      * @return Squared reprojection error in pixels^2

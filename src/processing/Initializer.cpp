@@ -750,7 +750,7 @@ bool Initializer::TriangulateSinglePoint(
     // Solve for lambda
     const Eigen::Vector2f lambda = A.inverse() * b;
     
-    // Stella VSLAM style: For equirectangular cameras, skip depth positive check
+    // For equirectangular cameras, skip depth positive check
     // (depth_is_positive = false for bearing_vector initializer)
     // Only check for finite values
     if (!std::isfinite(lambda(0)) || !std::isfinite(lambda(1))) {
@@ -778,7 +778,7 @@ int Initializer::TestPoseCandidate(
     int tri_fail = 0;
     int reproj_fail = 0;
     
-    // Stella VSLAM style: For equirectangular, use reprojection error to validate
+    // For equirectangular, use reprojection error to validate
     // instead of cheirality check
     
     for (size_t i = 0; i < bearings1.size(); ++i) {
@@ -798,7 +798,7 @@ int Initializer::TestPoseCandidate(
         Eigen::Vector3f point_in_frame2 = R * point3d + t;
         float err_cur = ComputeReprojectionErrorInFrame(point_in_frame2, bearings2[i]);
         
-        // Use reprojection error threshold (Stella VSLAM uses reproj_err_thr_)
+        // Use reprojection error threshold
         constexpr float kReprojErrThr = 5.0f;  // pixels
         if (err_ref < kReprojErrThr && err_cur < kReprojErrThr) {
             good_points++;
@@ -823,7 +823,7 @@ float Initializer::ComputeReprojectionErrorInFrame(
     const Eigen::Vector3f& point3d_in_frame,
     const Eigen::Vector3f& bearing_observed
 ) const {
-    // Stella VSLAM style: project 3D point to pixel coordinates
+    // Project 3D point to pixel coordinates
     // point3d_in_frame: 3D point already in the frame's coordinate system
     // bearing_observed: observed bearing in the same frame (normalized)
     
@@ -832,7 +832,7 @@ float Initializer::ComputeReprojectionErrorInFrame(
         return 1000.0f;  // Invalid point
     }
     
-    // Stella VSLAM cam_project: theta = atan2(x, z), phi = -asin(y/L)
+    // cam_project: theta = atan2(x, z), phi = -asin(y/L)
     // u = cols * (0.5 + theta/(2*pi)), v = rows * (0.5 - phi/pi)
     
     // Observed bearing -> pixel (bearing is already normalized)
@@ -848,7 +848,7 @@ float Initializer::ComputeReprojectionErrorInFrame(
     float u_proj = m_camera_width * (0.5f + theta_proj / (2.0f * M_PI));
     float v_proj = m_camera_height * (0.5f - phi_proj / M_PI);
     
-    // Simple pixel error (Stella VSLAM style - no wrap-around)
+    // Simple pixel error (no wrap-around)
     float du = u_obs - u_proj;
     float dv = v_obs - v_proj;
     
@@ -880,7 +880,7 @@ bool Initializer::ValidateInitialization(
     const std::vector<bool>& inlier_mask,
     float& mean_error
 ) const {
-    // Stella VSLAM style validation:
+    // Validation:
     // Check reprojection error in BOTH frames (ref and cur)
     
     int valid_count = 0;
@@ -905,7 +905,7 @@ bool Initializer::ValidateInitialization(
         
         const Eigen::Vector3f& pt = points3d[i];
         
-        // Stella VSLAM style: check reprojection error in BOTH frames
+        // Check reprojection error in BOTH frames
         
         // 1. Reprojection error in frame1 (reference)
         float error_ref = ComputeReprojectionErrorInFrame(pt, bearings1[i]);
@@ -1227,7 +1227,7 @@ double Initializer::ComputeFrameReprojectionError(const std::shared_ptr<Frame>& 
         
         if (L < 1e-6) continue;
         
-        // Equirectangular projection - Stella VSLAM compatible
+        // Equirectangular projection
         // Camera frame: X-right, Y-down, Z-forward
         // theta = atan2(x, z), phi = -asin(y/L)
         double theta = std::atan2(pcx, pcz);  // [-π, π]

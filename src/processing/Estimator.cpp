@@ -880,8 +880,7 @@ bool Estimator::TriangulateSinglePoint(
     const Eigen::Matrix4f& T2w,
     Eigen::Vector3f& point3d
 ) const {
-    // Stella VSLAM style triangulation using SVD
-    // Reference: stella_vslam/solve/triangulator.h
+    // Triangulation using SVD
     
     // Build 4x4 matrix A for SVD triangulation
     // A.row(0) = bearing_1(0) * cam_pose_1.row(2) - bearing_1(2) * cam_pose_1.row(0);
@@ -907,10 +906,8 @@ bool Estimator::TriangulateSinglePoint(
     // Convert to 3D point
     point3d = singular_vector.head<3>() / singular_vector(3);
     
-    // Stella VSLAM style: Equirectangular cameras skip depth check
+    // Equirectangular cameras skip depth check
     // because they can see in all directions (no "behind camera" concept)
-    // Reference: stella_vslam/module/two_view_triangulator.h check_depth_is_positive()
-    // "return camera->model_type_ == camera::model_type_t::Equirectangular || 0 < pos_z;"
     
     // Only check for valid (finite) coordinates and reasonable range
     if (!std::isfinite(point3d.x()) || !std::isfinite(point3d.y()) || !std::isfinite(point3d.z())) {
@@ -1038,7 +1035,7 @@ int Estimator::TriangulateNewMapPoints(
         float pixel_error2 = angle_error2 * kf2->GetWidth() / (2.0f * M_PI);
         
         // Reject if reprojection error is too large
-        // Stella VSLAM uses chi-squared: chi_sq_2D * sigma_sq = 5.99 * 1.0 ≈ 2.5 px
+        // Chi-squared threshold: chi_sq_2D * sigma_sq = 5.99 * 1.0 ≈ 2.5 px
         // // For equirectangular with more noise, use relaxed threshold
         // const float max_reproj_error = 5.0f;
         // if (pixel_error1 > max_reproj_error || pixel_error2 > max_reproj_error) {

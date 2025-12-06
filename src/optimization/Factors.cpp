@@ -79,7 +79,7 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
         return false;
     }
     
-    // Equirectangular projection - Stella VSLAM compatible
+    // Equirectangular projection
     // Camera frame: X-right, Y-down, Z-forward
     // theta = atan2(x, z), phi = -asin(y/L)
     // u = cols * (0.5 + theta/(2π)), v = rows * (0.5 - phi/π)
@@ -141,14 +141,14 @@ bool PnPFactor::Evaluate(double const* const* parameters, double* residuals, dou
     if (jacobians && jacobians[0]) {
         Eigen::Map<Eigen::Matrix<double, 2, 6, Eigen::RowMajor>> jac(jacobians[0]);
         
-        // Jacobian calculation - Stella VSLAM compatible
+        // Jacobian calculation
         // Camera extrinsic rotation matrix
         Eigen::Matrix3d Rcb = m_Tcb.block<3, 3>(0, 0);
         
         // Body frame coordinates: Pb = Rbw * Pw + tbw
         Eigen::Vector3d Pb = R_bw * m_world_point + t_bw;
         
-        // Equirectangular Jacobian - Stella VSLAM convention
+        // Equirectangular Jacobian
         // theta = atan2(x, z), phi = -asin(y/L)
         // u = cols * (0.5 + theta/(2π)), v = rows * (0.5 - phi/π)
         // 
@@ -234,7 +234,7 @@ double PnPFactor::compute_chi_square(double const* const* parameters) const {
         return std::numeric_limits<double>::max(); // Invalid, return large chi-square
     }
     
-    // Equirectangular projection - Stella VSLAM compatible
+    // Equirectangular projection
     double cols = m_camera_params.cols;
     double rows = m_camera_params.rows;
     
@@ -394,7 +394,7 @@ bool BAFactor::Evaluate(double const* const* parameters,
             return true;
         }
 
-        // Equirectangular projection - Stella VSLAM compatible
+        // Equirectangular projection
         // Camera frame: X-right, Y-down, Z-forward
         double cols = m_camera_params.cols;
         double rows = m_camera_params.rows;
@@ -456,7 +456,7 @@ bool BAFactor::Evaluate(double const* const* parameters,
         
         // Compute Jacobians if requested
         if (jacobians) {
-            // Equirectangular projection Jacobian - Stella VSLAM convention
+            // Equirectangular projection Jacobian
             // theta = atan2(x, z), phi = -asin(y/L)
             double xz_sq = pcx * pcx + pcz * pcz;
             double L_sq = L * L;
@@ -582,7 +582,7 @@ double BAFactor::compute_chi_square(double const* const* parameters) const {
         return 1000.0; // Large chi-square for invalid points
     }
     
-    // Equirectangular projection - Stella VSLAM compatible
+    // Equirectangular projection
     double cols = m_camera_params.cols;
     double rows = m_camera_params.rows;
     
